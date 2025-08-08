@@ -1,0 +1,47 @@
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel",
+    "setuptools_scm[toml]>=6.0"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytead"
+dynamic = ["version"]
+description = "A minimal tool to trace real Python function calls and generate pytest tests & enrich doc."
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT License"}
+authors = [
+  { name = "Nathan Palluau", email = "nathan.palluau@gmail.com" }
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Testing",
+  "License :: OSI Approved :: MIT License"
+]
+keywords = ["testing", "pytest", "tracing", "automation"]
+dependencies = []
+
+# Console script entry points for the CLI
+[project.scripts]
+pytead = "pytead.cli:main"
+
+[project.urls]
+Homepage      = "https://github.com/nathanap2/pytead"
+Repository    = "https://github.com/nathanap2/pytead"
+Documentation = "https://github.com/nathanap2/pytead#readme"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["pytead"]
+
+[tool.setuptools_scm]
+version_scheme    = "post-release"
+local_scheme      = "no-local-version"
+fallback_version  = "0.1.0"
