@@ -1,112 +1,227 @@
-Pytead
+# Pytead (aka **T3AD** — Trace To Test And Doc)
 
-Pytead is a tool that automatically captures real Python function calls in your application and generates pytest unit tests based on those execution traces.
+> Capture **real** Python function calls while your app runs, then turn those traces into **pytest** tests — and (soon) into **living examples** for your docs.
 
-📦 Installation
+For your information, I developed this module to improve the compatibility of my code with LLMs because I noticed that LLMs understood the role of a function better when I gave them a concrete, real-world example of how that function was used (for example, through a unit test or directly in the function documentation). I wanted to automate the process. The module is therefore designed for vibe coding or similar, but it can also be used in more traditional contexts.
 
-clone the repo and then install it as an egg (for the moment this is the easiest way ...)
 
+---
+
+## ✨ What it does
+
+* **Runtime tracing** of a target function’s *real* calls (args, kwargs, return value, timestamp).
+* **Deterministic test generation**: turns traces into parameterized pytest tests.
+
+---
+
+## 📦 Installation
+
+```bash
+# clone your fork
 pip install -e .
+```
 
-This provides two console scripts:
+Requirements: Python ≥ 3.7. License: MIT.
 
-TBD: instruments your code to record function calls
+The install exposes a single CLI entry point:
 
-TBD: generates pytest test modules from recorded traces
+* `pytead` — with subcommands `run` and `gen`.
 
-? How It Works
+---
 
-Instrumentation:
+## 🚀 Quickstart
 
-Use the Pytead CLI or the @trace2test decorator to wrap a target function. Each invocation of that function is intercepted.
+Suppose you have:
 
-Capture:
+```python
+# mymodule.py
 
-While using the scanned program, when we call a function we serialize (arguments, keyword arguments, return value, timestamp) into .pkl files in a designated storage_dir.
+def multiply(a, b):
+    return a * b
+```
 
-Test Generation:
+```python
+# main.py
+from mymodule import multiply
 
-The gentests CLI reads all .pkl files in the calls directory and renders a pytest-compatible test file. Each recorded call becomes one assert.
+for (x, y) in [(2, 3), (2, 3), (10, 0)]:
+    multiply(x, y)
+```
 
+### 1) Trace real calls while running your app
 
-🎛️ Usage
-
-1. Instrumentation via CLI
-
-Instead of manually importing the decorator, run:
-
-trace2test \
+```bash
+pytead run \
   --limit 5 \
   --storage-dir call_logs \
-  mymodule.my_function \
+  mymodule.multiply \
   -- python3 main.py
+```
 
---limit (int): maximum number of calls to record per function (default: 10).
+You should see logs in `call_logs/` like:
 
---storage-dir (str): directory for storing trace files (default: call_logs).
+```
+mymodule_multiply__<uuid>.pkl
+```
 
-You will see output like:
+Each pickle contains a dict like:
 
-✓ Instrumentation on mymodule.my_function
-[trace2test] cwd = '/path/to/project', storage_dir = 'call_logs'
-[trace2test] log written to '/path/to/project/call_logs/mymodule_my_function__abc123.pkl'
+```python
+{
+  "func": "mymodule.multiply",
+  "args": (2, 3),
+  "kwargs": {},
+  "result": 6,
+  "timestamp": "2025-08-08T19:21:15.123456"
+}
+```
 
-2. Generating Tests
+### 2) Generate pytest tests from traces
 
-gentests \
-  --calls-dir call_logs \
-  --output tests/test_generated.py
+**Single file**:
 
---calls-dir: where to read .pkl traces (default: call_logs).
+```bash
+pytead gen -c call_logs -o tests/test_pytead_generated.py
+```
 
---output: path to write the generated pytest file (default: tests/test_pytead_generated.py).
+**One file per function**:
 
-Sample generated file:
+```bash
+pytead gen -c call_logs -d tests/generated
+```
 
-import pytest
-from mymodule import my_function
+This will produce files like `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
 
-def test_my_function_1():
-    assert my_function(2, 3) == 6
+Run them with:
 
-Then run:
+```bash
+pytest -q
+```
 
-pytest tests
+---
+
+## 🎛️ CLI reference
+
+### `pytead run`
+
+Instrument a **module‑level** function and execute a Python script.
+
+```
+pytead run [options] <module.function> -- <script.py> [script args...]
+```
+
+**Options**
+
+* `-l, --limit INT` — max calls to record per function (default: 10)
+* `-s, --storage-dir PATH` — where to write trace pickles (default: `call_logs/`)
+
+**Notes**
+
+* The target must be in the form `package.module.function` (exactly one final identifier). Class or nested methods (`module.Class.method`) are **not** supported yet via the CLI.
+* Only the **root** invocation of the traced function is recorded in a call stack (thread‑local depth control).
+
+### `pytead gen`
+
+Generate pytest tests from previously recorded traces.
+
+```
+pytead gen [options]
+```
+
+**Options**
+
+* `-c, --calls-dir PATH` — directory containing `.pkl` traces (default: `call_logs/`)
+* `-o, --output PATH` — write a single test module (default: `tests/test_pytead_generated.py`)
+* `-d, --output-dir PATH` — instead of a single file, write one test module **per function** into this directory
+
+**Behavior**
+
+* Exact duplicate cases (same `args`, `kwargs`, and `result`) are deduplicated.
+* Values are rendered with `repr(...)` into the generated test code.
+
+---
+
+## 🧩 Decorator mode (alternative to CLI)
+
+You can also decorate the function directly:
+
+```python
+from pytead import trace
+
+@trace(limit=5, storage_dir="call_logs")
+def multiply(a, b):
+    return a * b
+```
+
+Running your program will then emit the same `.pkl` traces; generate tests with `pytead gen` as above.
+
+You may also provide a custom serializer (+ a method to dump/read) :
+
+```python
+from pathlib import Path
+import json, uuid
+
+class MyJsonStorage:
+    extension = ".json"
+
+    def make_path(self, storage_dir: Path, func_fullname: str) -> Path:
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        prefix = func_fullname.replace(".", "_")
+        return storage_dir / f"{prefix}__{uuid.uuid4().hex}{self.extension}"
+
+    def dump(self, entry: dict, path: Path) -> None:
+        path.write_text(json.dumps(entry, default=str), encoding="utf-8")
+
+    def load(self, path: Path) -> dict:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data
+
+from pytead import trace
+@trace(storage_dir="call_logs", storage=MyJsonStorage())
+def f(x): ...
+    ...
+
+```
 
 
-🔭 .. To be continued
+---
 
-I started the project 2 days ago, please let me some time to improve it :D
+## 🛠️ How it works (design notes)
 
-Next steps : 
+* **Monkey‑patching**: `pytead run` imports the target module, wraps `module.function` with the decorator, and then runs your script. Your code calls the wrapped function transparently.
+* **Root‑call only**: a thread‑local depth counter ensures only the outermost invocation of the traced function is logged (avoids a storm of nested traces).
+* **Pickle traces**: by default, traces are saved as pickle files to keep Python types round‑trippable. Generation uses `repr(...)` to embed literals in test code.
+* **Parameterized tests**: for each traced function, tests are generated with `@pytest.mark.parametrize('args, kwargs, expected', [...])` and a single `assert func(*args, **kwargs) == expected`.
 
-Support method calls and function with side effects
+---
 
-Deduplicate similar traces via input hashing or similarity algorithms.
+## ⚠️ Limitations & caveats (current state)
 
-Enrich traces with execution metadata (duration, argument hashes, exit codes).
+* **Methods / attributes**: the CLI targets `module.function` only; `module.Class.method` isn’t supported yet (workaround: decorate at definition site, or expose a module‑level wrapper and trace that).
+* **Side effects & exceptions**: not yet captured. Tests assume **pure** behavior (idempotent, no I/O or global state).
+* **Non‑reprable results**: generated code relies on `repr(...)`. Highly custom objects may not round‑trip. Prefer simple / JSON‑like data for now.
+* **Flaky functions**: if a function is time‑ or randomness‑dependent, generated tests may fail nondeterministically.
 
-Switch from pickle to jsonpickle or a custom JSON schema to preserve complex types (tuples, datetimes).
+---
 
-Full-featured CLI: pytead run, pytead gen-tests, pytead clean, etc.
+## 🗺️ Roadmap
 
-Enrich function documentation with real examples
+* Capture **exceptions** and generate `with pytest.raises(...)` cases.
+* Opt‑in capture of **side‑effects** (stdout, file I/O summaries, env changes).
+* Support for **`module.Class.method`** targets in the CLI.
+* Pluggable **serialization** (JSON schema / jsonpickle) shipped in the CLI. -> in progress
+* Smarter **deduplication** 
+* **Doc enrichment**: promote real traces as runnable examples in docstrings / Markdown to aid LLM‑assisted code reading.
 
-Chose these real examples supposed to enrich doc in order to optimize LLMs understanding of the project directly from reading the doc
+---
 
-🔗 Related Tools & Approaches
+## 🔗 Related tools & approaches
 
-- Snapshot Testing (pytest-snapshot, snapshottest, Syrupy): captures function outputs via explicit snapshot.assert_match(...) calls in tests, but does not record actual inputs or run in production.
+* **Snapshot testing** (e.g., `pytest-snapshot`, `snapshottest`, `Syrupy`): good for pinning outputs in tests, but they don’t harvest *runtime inputs* from production runs.
+* **Synthetic test generation** (e.g., **Pynguin**): explores inputs for coverage, not based on *your* real executions.
+* **AOP / tracers** (e.g., `aspectlib`, `sys.settrace`): can intercept calls, but do not automatically emit ready‑to‑run pytest modules.
+* **Similar spirit elsewhere**: tools like **Keploy** (focus on external I/O) and some JS utilities (e.g., unit‑test recorders) share the trace‑to‑tests idea but target different layers.
 
-- Synthetic Test Generation (Pynguin): explores the input space to maximize coverage, but doesn't leverage real runtime execution data.
+---
 
-- AOP / Tracers (aspectlib, sys.settrace): intercept function calls and returns on-the-fly in production, but do not provide an automatic mechanism to generate standalone test files.
-
-Equivalent Projects in Other Languages or Contexts
-
-In node.js, from what i've read, unit-test-recorder (UTR) seems to be similar to this project (but i'm not familiar with js)
-
-Keploy seems to stem from the same idea, but, from what I understand, focuses on the i/o between the program and external dependancies.
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENCE)
