@@ -16,22 +16,17 @@ For your information, I developed this module to improve the compatibility of my
 
 ## 📦 Installation
 
+The easiest way for now is to clone your fork from github and to directly install it with
+
 ```bash
-# clone your fork
 pip install -e .
 ```
-
-Requirements: Python ≥ 3.7. License: MIT.
-
-The install exposes a single CLI entry point:
-
-* `pytead` — with subcommands `run` and `gen`.
 
 ---
 
 ## 🚀 Quickstart
 
-Suppose you have:
+Suppose you have a function called, for instance, multiply:
 
 ```python
 # mymodule.py
@@ -39,6 +34,7 @@ Suppose you have:
 def multiply(a, b):
     return a * b
 ```
+... and that you call your function multiply in ...
 
 ```python
 # main.py
@@ -48,51 +44,28 @@ for (x, y) in [(2, 3), (2, 3), (10, 0)]:
     multiply(x, y)
 ```
 
+... now let's use pytead on your function multiply :
+
 ### 1) Trace real calls while running your app
 
 ```bash
-pytead run \
-  --limit 5 \
-  --storage-dir call_logs \
-  mymodule.multiply \
-  -- python3 main.py
+pytead run mymodule.multiply -- python3 main.py
 ```
 
-You should see logs in `call_logs/` like:
+This will register logs in a dir such as `call_logs/`, and we can now use these logs to produce unit tests : 
 
-```
-mymodule_multiply__<uuid>.pkl
-```
-
-Each pickle contains a dict like:
-
-```python
-{
-  "func": "mymodule.multiply",
-  "args": (2, 3),
-  "kwargs": {},
-  "result": 6,
-  "timestamp": "2025-08-08T19:21:15.123456"
-}
-```
 
 ### 2) Generate pytest tests from traces
 
-**Single file**:
-
 ```bash
-pytead gen -c call_logs -o tests/test_pytead_generated.py
+pytead gen
 ```
 
-**One file per function**:
-
-```bash
-pytead gen -c call_logs -d tests/generated
-```
+... and, that's all !
 
 This will produce files like `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
 
-Run them with:
+You can run them at any moment with pytest:
 
 ```bash
 pytest -q
@@ -183,6 +156,55 @@ def f(x): ...
 
 ```
 
+# Configuration
+
+Pytead reads optional configuration from TOML files. Command-line flags **always override** config values. Within a config file, section-specific values override `[defaults]`.
+
+### Where pytead looks for config (in order)
+
+**Project-local** (searching upward from the current working directory):
+1. `./.pytead/default_config.toml`
+2. `./.pytead/config.toml`
+
+**User-level** (fallbacks):
+1. `$PYTEAD_CONFIG` (explicit path, if set)
+2. `$XDG_CONFIG_HOME/pytead/config.toml`
+3. `~/.config/pytead/config.toml`
+4. `~/.pytead/config.toml`
+
+> Nearest project file wins over user-level files.
+
+### Precedence
+
+1. **CLI flags** (highest)
+2. Command section (e.g. `[run]`, `[gen]`, `[clean]`, `[tead]`)
+3. `[defaults]` section
+
+### Example: project config
+
+Create `.pytead/default_config.toml` at your project root:
+
+```toml
+[defaults]
+limit = 10
+storage_dir = "call_logs"
+format = "pickle"
+
+[run]
+limit = 7
+targets = ["mymodule.multiply"]
+
+[gen]
+output_dir = "tests/generated"
+
+[clean]
+calls_dir = "call_logs"
+
+[tead]
+targets = ["mymodule.multiply"]
+calls_dir = "call_logs"
+only_targets = true
+```
 
 ---
 
@@ -199,7 +221,7 @@ def f(x): ...
 
 * **Methods / attributes**: the CLI targets `module.function` only; `module.Class.method` isn’t supported yet (workaround: decorate at definition site, or expose a module‑level wrapper and trace that).
 * **Side effects & exceptions**: not yet captured. Tests assume **pure** behavior (idempotent, no I/O or global state).
-* **Non‑reprable results**: generated code relies on `repr(...)`. Highly custom objects may not round‑trip. Prefer simple / JSON‑like data for now.
+* **Non‑reprable results**: generated code relies on `repr(...)`. Highly custom objects may not round‑trip. Prefer simple / JSON‑like data for now, or provide your own serializer.
 * **Flaky functions**: if a function is time‑ or randomness‑dependent, generated tests may fail nondeterministically.
 
 ---
@@ -211,6 +233,7 @@ def f(x): ...
 * Support for **`module.Class.method`** targets in the CLI.
 * Pluggable **serialization** (JSON schema / jsonpickle) shipped in the CLI. -> in progress
 * Smarter **deduplication** 
+* Automatic detection of which unit tests fail even without code modification, because of randomness or uncontrolled dependencies, by calling pytest after run & gen, and rejection of these tests
 * **Doc enrichment**: promote real traces as runnable examples in docstrings / Markdown to aid LLM‑assisted code reading.
 
 ---

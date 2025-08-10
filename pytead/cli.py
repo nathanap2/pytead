@@ -15,20 +15,17 @@ from pytead.gen_tests import (
 )
 from pytead.storage import get_storage
 from pytead._cases import unique_cases
+from pytead.logconf import configure_logger
 
+from pytead.clean import add_subparser as add_clean_subparser
+from pytead.tead_all_in_one import add_subparser as add_tead_subparser
 
-def configure_logger(level: int = logging.INFO) -> logging.Logger:
-    """
-    Configure a single StreamHandler for the 'pytead' logger (CLI context only).
-    The library itself stays quiet (it uses a NullHandler).
-    """
-    root = logging.getLogger("pytead")
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("[pytead] %(levelname)s: %(message)s"))
-        root.addHandler(handler)
-    root.setLevel(level)
-    return logging.getLogger("pytead.cli")
+# Config: read-only from default_config.toml (project root or parents)
+from .config import (
+    apply_config_from_default_file,
+    get_effective_config,
+    LAST_CONFIG_PATH,
+)
 
 
 def _unique_count(entries_by_func: Dict[str, List[Dict[str, Any]]]) -> int:
@@ -46,17 +43,14 @@ def _split_targets_and_cmd(args: argparse.Namespace) -> Tuple[List[str], List[st
     targets = list(args.targets or [])
     cmd = list(args.cmd or [])
 
-    # 1) If '--' accidentally captured into targets, split
     if "--" in targets:
         sep = targets.index("--")
         cmd = targets[sep + 1 :] + cmd
         targets = targets[:sep]
 
-    # 2) Normalize 'cmd': drop leading '--' if present
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
 
-    # 3) If a .py sneaked into targets (forgotten '--'), split there
     for i, tok in enumerate(targets):
         if tok.endswith(".py"):
             cmd = targets[i:] + cmd
@@ -68,23 +62,68 @@ def _split_targets_and_cmd(args: argparse.Namespace) -> Tuple[List[str], List[st
 
 def _cmd_run(args: argparse.Namespace) -> None:
     """Instrument one or more functions and run the target script."""
-    logger = configure_logger()
+    logger = configure_logger(name="pytead.cli")
 
+    # 0) Show raw args as parsed by argparse (before config injection)
+    logger.info(
+        "RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)}
+    )
+
+    # 1) Fill from default_config.toml (does NOT override explicit CLI flags)
+    apply_config_from_default_file("run", args)
+
+    # 2) Show effective args after config injection
+    logger.info(
+        "RUN: effective args (post-config): %s",
+        {k: getattr(args, k) for k in vars(args)},
+    )
+
+    # 3) Validate required options (no in-code defaults here)
+    missing = [k for k in ("limit", "storage_dir", "format") if not hasattr(args, k)]
+    if missing:
+        logger.error(
+            "Missing required options for 'run': %s. "
+            "Please set them in [defaults] or [run] of default_config.toml or pass flags.",
+            ", ".join(missing),
+        )
+        sys.exit(1)
+
+    # Snapshot effective config for potential fallback of targets
+    effective_cfg = get_effective_config("run")
+    logger.info("RUN: effective config snapshot: %s", effective_cfg or "{}")
+
+    # 4) Split positional targets and the '-- script.py [args...]' part
     targets, cmd = _split_targets_and_cmd(args)
+    logger.info("RUN: split targets=%s cmd=%s", targets, cmd)
+
+    # Fallback: if targets ended up empty (e.g., because a *.py was moved to cmd),
+    # let config supply the function targets.
+    if not targets:
+        cfg_targets = (
+            effective_cfg.get("targets") if isinstance(effective_cfg, dict) else None
+        )
+        if cfg_targets:
+            logger.info(
+                "RUN: no CLI targets after split; falling back to config targets: %s",
+                cfg_targets,
+            )
+            targets = list(cfg_targets)
 
     if not targets:
-        logger.error("No target provided. Expect at least one 'module.function'.")
+        logger.error(
+            "No target provided. Expect at least one 'module.function'. Config file used: %s",
+            LAST_CONFIG_PATH,
+        )
         sys.exit(1)
     if not cmd:
         logger.error("No script specified after '--'")
         sys.exit(1)
 
+    # 5) Prepare import path and storage backend
     sys.path.insert(0, str(Path.cwd()))
-
-    # Select storage backend (pickle by default)
     storage = get_storage(args.format)
 
-    # --- Phase 1: resolve & validate all targets ---
+    # 6) Resolve module.function targets and apply instrumentation
     resolved = []  # list[(module, module_name, func_name)]
     errors: List[str] = []
     for t in targets:
@@ -112,7 +151,6 @@ def _cmd_run(args: argparse.Namespace) -> None:
             logger.error(m)
         sys.exit(1)
 
-    # --- Phase 2: instrument all targets ---
     seen = set()
     for module, module_name, func_name in resolved:
         key = (module_name, func_name)
@@ -131,7 +169,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
         ", ".join(f"{m}.{f}" for (m, f) in seen),
     )
 
-    # Execute the script
+    # 7) Execute the target script
     script = cmd[0]
     if not script.endswith(".py"):
         logger.error("Unsupported script '%s': only .py files are allowed", script)
@@ -147,92 +185,117 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
 def _cmd_gen(args: argparse.Namespace) -> None:
     """Generate pytest tests from recorded traces."""
-    logger = configure_logger()
+    logger = configure_logger(name="pytead.cli")
 
-    # Default to single output file if neither -o nor -d were given
-    if args.output is None and args.output_dir is None:
-        args.output = Path("tests/test_pytead_generated.py")
+    # Fill from default_config.toml
+    apply_config_from_default_file("gen", args)
 
-    if not args.calls_dir.exists() or not args.calls_dir.is_dir():
+    # Validate required options (no in-code defaults)
+    calls_dir = getattr(args, "calls_dir", None)
+    output = getattr(args, "output", None)
+    output_dir = getattr(args, "output_dir", None)
+    formats = getattr(args, "formats", None)
+
+    if calls_dir is None:
         logger.error(
-            "Calls directory '%s' does not exist or is not a directory", args.calls_dir
+            "Missing 'calls_dir' for 'gen'. Please set [gen].calls_dir in default_config.toml "
+            "or pass -c/--calls-dir."
+        )
+        sys.exit(1)
+    if output is None and output_dir is None:
+        logger.error(
+            "You must set either [gen].output or [gen].output_dir in default_config.toml "
+            "or pass -o/--output or -d/--output-dir."
         )
         sys.exit(1)
 
-    entries = collect_entries(calls_dir=args.calls_dir, formats=args.formats)
+    calls_dir = Path(calls_dir)
+    if not calls_dir.exists() or not calls_dir.is_dir():
+        logger.error(
+            "Calls directory '%s' does not exist or is not a directory", calls_dir
+        )
+        sys.exit(1)
+
+    entries = collect_entries(calls_dir=calls_dir, formats=formats)
     total_unique = _unique_count(entries)
 
-    if args.output_dir is not None:
-        write_tests_per_func(entries, args.output_dir)
+    if output_dir is not None:
+        write_tests_per_func(entries, Path(output_dir))
         logger.info(
             "Generated %d test modules in '%s' (%d total unique tests)",
             len(entries),
-            args.output_dir,
+            output_dir,
             total_unique,
         )
     else:
         source = render_tests(entries)
-        write_tests(source, args.output)
-        logger.info("Generated '%s' with %d unique tests", args.output, total_unique)
+        write_tests(source, Path(output))
+        logger.info("Generated '%s' with %d unique tests", output, total_unique)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="pytead")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # `run` subcommand
+    # `run`
     p_run = subparsers.add_parser(
         "run",
         help="instrument one or more functions and execute a Python script (use -- to separate targets from the script)",
     )
+    # No hard-coded defaults: config file fills missing values
     p_run.add_argument(
         "-l",
         "--limit",
         type=int,
-        default=10,
-        help="max number of calls to record per function (default: 10)",
+        default=argparse.SUPPRESS,
+        help="max number of calls to record per function",
     )
     p_run.add_argument(
         "-s",
         "--storage-dir",
         type=Path,
-        default=Path("call_logs"),
-        help="directory to store trace files (default: call_logs/)",
+        default=argparse.SUPPRESS,
+        help="directory to store trace files",
     )
     p_run.add_argument(
         "--format",
         choices=["pickle", "json", "repr"],
-        default="pickle",
-        help="trace storage format (default: pickle)",
+        default=argparse.SUPPRESS,
+        help="trace storage format",
     )
     p_run.add_argument(
         "targets",
-        nargs="+",
+        nargs="*",
+        default=argparse.SUPPRESS,
         metavar="target",
-        help="one or more functions to trace, each in module.function format",
+        help="one or more functions to trace, each in module.function format "
+        "(may be provided via config [run].targets)",
     )
+
     p_run.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
         help="-- then the Python script to run (with arguments)",
     )
-    p_run.set_defaults(func=_cmd_run)
+    p_run.set_defaults(
+        handler=_cmd_run
+    )  # keep 'handler' to avoid collision with --func
 
-    # `gen` subcommand
+    # `gen`
     p_gen = subparsers.add_parser("gen", help="generate pytest tests from traces")
     p_gen.add_argument(
         "-c",
         "--calls-dir",
         type=Path,
-        default=Path("call_logs"),
-        help="directory containing trace files (default: call_logs/)",
+        default=argparse.SUPPRESS,
+        help="directory containing trace files",
     )
     group = p_gen.add_mutually_exclusive_group()
     group.add_argument(
         "-o",
         "--output",
         type=Path,
-        default=None,
+        default=argparse.SUPPRESS,
         help="single-file output for generated tests",
     )
     group.add_argument(
@@ -240,21 +303,23 @@ def main() -> None:
         "--output-dir",
         dest="output_dir",
         type=Path,
-        default=None,
+        default=argparse.SUPPRESS,
         help="write one test module per function in this directory",
     )
     p_gen.add_argument(
         "--formats",
         choices=["pickle", "json", "repr"],
         nargs="*",
+        default=argparse.SUPPRESS,
         help="restrict to these formats when reading (default: auto-detect all)",
     )
-    p_gen.set_defaults(func=_cmd_gen)
+    p_gen.set_defaults(handler=_cmd_gen)
 
-    # Future subcommands: clean, doc, etc.
+    add_clean_subparser(subparsers)
+    add_tead_subparser(subparsers)
 
     args = parser.parse_args()
-    args.func(args)
+    args.handler(args)
 
 
 if __name__ == "__main__":

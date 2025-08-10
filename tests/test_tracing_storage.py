@@ -1,4 +1,3 @@
-# tests/test_tracing_storage.py
 import pytest
 from pathlib import Path
 
