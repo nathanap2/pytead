@@ -8,7 +8,6 @@ from typing import List, Dict, Any, Tuple
 from .tracing import trace
 from .gen_tests import collect_entries, render_tests, write_tests, write_tests_per_func
 from .storage import get_storage, storages_from_names
-from ._cases import unique_cases
 from .clean import _plan_deletions
 from .logconf import configure_logger
 from .config import (
@@ -16,36 +15,7 @@ from .config import (
     get_effective_config,
     LAST_CONFIG_PATH,
 )
-
-
-def _split_targets_and_cmd(
-    targets: List[str], cmd: List[str]
-) -> Tuple[List[str], List[str]]:
-    """
-    Robustly split targets and command:
-    - If '--' is in targets, split there.
-    - Strip a leading '--' from cmd.
-    - If a *.py token was mistakenly placed among targets, split there.
-    """
-    targets = list(targets or [])
-    cmd = list(cmd or [])
-    if "--" in targets:
-        sep = targets.index("--")
-        cmd = targets[sep + 1 :] + cmd
-        targets = targets[:sep]
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    for i, tok in enumerate(targets):
-        if tok.endswith(".py"):
-            cmd = targets[i:] + cmd
-            targets = targets[:i]
-            break
-    return targets, cmd
-
-
-def _unique_count(entries_by_func: Dict[str, List[Dict[str, Any]]]) -> int:
-    return sum(len(unique_cases(entries)) for entries in entries_by_func.values())
-
+from ._cli_utils import split_targets_and_cmd, unique_count, fallback_targets_from_cfg
 
 def run(args) -> None:
     """End-to-end: trace targets while running a script, then generate pytest tests."""
@@ -90,22 +60,13 @@ def run(args) -> None:
     logger.info("TEAD: effective config snapshot: %s", effective_cfg or "{}")
 
     # 3) Targets & command (robust split; '.py' tokens move to cmd)
-    targets, cmd = _split_targets_and_cmd(
+    targets, cmd = split_targets_and_cmd(
         getattr(args, "targets", []) or [], getattr(args, "cmd", [])
     )
     logger.info("TEAD: split targets=%s cmd=%s", targets, cmd)
 
     # Fallback: if targets ended up empty (e.g., a *.py was moved to cmd), let config supply them.
-    if not targets:
-        cfg_targets = (
-            effective_cfg.get("targets") if isinstance(effective_cfg, dict) else None
-        )
-        if cfg_targets:
-            logger.info(
-                "TEAD: no CLI targets after split; falling back to config targets: %s",
-                cfg_targets,
-            )
-            targets = list(cfg_targets)
+    targets = fallback_targets_from_cfg(targets, effective_cfg, logger, "TEAD")
 
     if not targets:
         logger.error(
@@ -268,7 +229,7 @@ def run(args) -> None:
             )
             return
 
-    total_unique = _unique_count(entries)
+    total_unique = unique_count(entries)
     logger.info(
         "TEAD: found %d function(s), %d unique case(s).", len(entries), total_unique
     )
@@ -284,7 +245,7 @@ def run(args) -> None:
         )
 
 
-def add_subparser(subparsers) -> None:
+def add_tead_subparser(subparsers) -> None:
     p = subparsers.add_parser(
         "tead",
         help="trace functions by running a script, then immediately generate pytest tests",

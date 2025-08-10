@@ -6,13 +6,13 @@ def test_tead_targets_fallback_from_config(tmp_path, monkeypatch, caplog):
     """
     When the user runs `pytead tead -- main.py`, argparse can leave `targets=['main.py']`
     and `cmd=[]`. Our split then moves the .py to cmd, leaving targets empty.
-    This test checks that TEAD falls back to [tead].targets from .pytead/default_config.toml.
+    This test checks that TEAD falls back to [tead].targets from .pytead/config.toml.
     """
     monkeypatch.chdir(tmp_path)
 
     # --- Write project-local config under .pytead/ ---
     (tmp_path / ".pytead").mkdir()
-    (tmp_path / ".pytead" / "default_config.toml").write_text(
+    (tmp_path / ".pytead" / "config.toml").write_text(
         "\n".join(
             [
                 "[defaults]",

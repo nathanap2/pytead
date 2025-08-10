@@ -16,7 +16,7 @@ def test_project_dotpytead_default_config_wins_over_parent_and_user(
     tmp_path: Path, monkeypatch
 ):
     """
-    When both a project-local .pytead/default_config.toml and a parent-level file exist,
+    When both a project-local .pytead/config.toml and a parent-level file exist,
     the nearest project-local file must be selected.
     """
     # Fake HOME and XDG to avoid leaking host config
@@ -34,10 +34,10 @@ def test_project_dotpytead_default_config_wins_over_parent_and_user(
     deep = proj / "src" / "pkg"
 
     # Parent-level config (should be ignored in favor of project-local)
-    _touch(parent_proj / ".pytead" / "default_config.toml")
+    _touch(parent_proj / ".pytead" / "config.toml")
 
     # Project-level config (nearest wins)
-    chosen = _touch(proj / ".pytead" / "default_config.toml")
+    chosen = _touch(proj / ".pytead" / "config.toml")
 
     # Also create user-level configs (should be ignored)
     _touch(xdg / "pytead" / "config.toml")
@@ -54,9 +54,6 @@ def test_project_dotpytead_default_config_wins_over_parent_and_user(
 def test_project_dotpytead_config_toml_used_if_default_missing(
     tmp_path: Path, monkeypatch
 ):
-    """
-    If only .pytead/config.toml exists (no default_config.toml), it must be selected.
-    """
     home = tmp_path / "home"
     xdg = tmp_path / "xdg"
     home.mkdir()
@@ -128,9 +125,6 @@ def test_xdg_beats_home_configs_when_no_project_or_env(tmp_path: Path, monkeypat
 
 
 def test_project_config_wins_even_if_env_is_set(tmp_path: Path, monkeypatch):
-    """
-    Project-local .pytead/default_config.toml must win even when PYTEAD_CONFIG is set.
-    """
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -138,7 +132,7 @@ def test_project_config_wins_even_if_env_is_set(tmp_path: Path, monkeypatch):
 
     proj = tmp_path / "proj"
     deep = proj / "d1" / "d2"
-    chosen = _touch(proj / ".pytead" / "default_config.toml")
+    chosen = _touch(proj / ".pytead" / "config.toml")
     deep.mkdir(parents=True)
     monkeypatch.chdir(deep)
 

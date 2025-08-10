@@ -2,23 +2,24 @@
 
 > Capture **real** Python function calls while your app runs, then turn those traces into **pytest** tests — and (soon) into **living examples** for your docs.
 
-For your information, I developed this module to improve the compatibility of my code with LLMs because I noticed that LLMs understood the role of a function better when I gave them a concrete, real-world example of how that function was used (for example, through a unit test or directly in the function documentation). I wanted to automate the process. The module is therefore designed for vibe coding or similar, but it can also be used in more traditional contexts.
-
+I built Pytead to give LLMs and humans concrete usage examples of functions with **zero manual wiring**. It records real calls while you run your program and turns them into deterministic, parameterized tests. It’s handy for vibe-coding and perfectly fine in traditional projects.
 
 ---
 
-## ✨ What it does
+## ✨ Features
 
 * **Runtime tracing** of a target function’s *real* calls (args, kwargs, return value, timestamp).
-* **Deterministic test generation**: turns traces into parameterized pytest tests.
+* **Deterministic test generation** → parameterized **pytest** tests.
 
 ---
 
 ## 📦 Installation
 
-The easiest way for now is to clone your fork from github and to directly install it with
+For now, install from your local clone:
 
 ```bash
+git clone https://github.com/<you>/pytead
+cd pytead
 pip install -e .
 ```
 
@@ -26,15 +27,15 @@ pip install -e .
 
 ## 🚀 Quickstart
 
-Suppose you have a function called, for instance, multiply:
+Say you have ...
 
 ```python
 # mymodule.py
-
 def multiply(a, b):
     return a * b
 ```
-... and that you call your function multiply in ...
+
+... and you call it in ...
 
 ```python
 # main.py
@@ -44,16 +45,15 @@ for (x, y) in [(2, 3), (2, 3), (10, 0)]:
     multiply(x, y)
 ```
 
-... now let's use pytead on your function multiply :
+... let's use pytead on it :
 
 ### 1) Trace real calls while running your app
 
 ```bash
-pytead run mymodule.multiply -- python3 main.py
+pytead run mymodule.multiply -- main.py
 ```
 
-This will register logs in a dir such as `call_logs/`, and we can now use these logs to produce unit tests : 
-
+This launch your program as usual, but will write trace files while you're using it.
 
 ### 2) Generate pytest tests from traces
 
@@ -61,11 +61,9 @@ This will register logs in a dir such as `call_logs/`, and we can now use these 
 pytead gen
 ```
 
-... and, that's all !
+This writes tests like `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
 
-This will produce files like `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
-
-You can run them at any moment with pytest:
+You can run them later, after working on the code, to check your function still behave the same
 
 ```bash
 pytest -q
@@ -73,25 +71,29 @@ pytest -q
 
 ---
 
-## 🎛️ CLI reference
+## 🎛️ CLI reference (overview)
 
 ### `pytead run`
 
-Instrument a **module‑level** function and execute a Python script.
+Instrument one or more **module-level** functions and execute a Python script.
 
 ```
-pytead run [options] <module.function> -- <script.py> [script args...]
+pytead run [options] <module.function> [...] -- <script.py> [script args...]
 ```
 
-**Options**
+**Common options**
 
-* `-l, --limit INT` — max calls to record per function (default: 10)
-* `-s, --storage-dir PATH` — where to write trace pickles (default: `call_logs/`)
+* `-l, --limit INT` — max calls to record per function
+* `-s, --storage-dir PATH` — where to write trace files (default: from config; packaged default: `call_logs/`)
+* `--format {pickle,json,repr}` — storage format
 
 **Notes**
 
-* The target must be in the form `package.module.function` (exactly one final identifier). Class or nested methods (`module.Class.method`) are **not** supported yet via the CLI.
-* Only the **root** invocation of the traced function is recorded in a call stack (thread‑local depth control).
+* Targets must be `package.module.function`. Class methods (`module.Class.method`) are not yet supported via the CLI (decorate at definition site or wrap at module level).
+* Only the **root** invocation of the traced function is recorded per call stack (thread-local depth control).
+* If you forget `--` and put `script.py` after targets, Pytead will do its best to split correctly.
+
+---
 
 ### `pytead gen`
 
@@ -101,22 +103,55 @@ Generate pytest tests from previously recorded traces.
 pytead gen [options]
 ```
 
-**Options**
+**Common options**
 
-* `-c, --calls-dir PATH` — directory containing `.pkl` traces (default: `call_logs/`)
-* `-o, --output PATH` — write a single test module (default: `tests/test_pytead_generated.py`)
-* `-d, --output-dir PATH` — instead of a single file, write one test module **per function** into this directory
+* `-c, --calls-dir PATH` — directory containing trace files
+* `-o, --output PATH` — write a single test module
+* `-d, --output-dir PATH` — write one test module **per function** into this directory
+* `--formats {pickle,json,repr}...` — restrict which formats to read
 
 **Behavior**
 
-* Exact duplicate cases (same `args`, `kwargs`, and `result`) are deduplicated.
-* Values are rendered with `repr(...)` into the generated test code.
+* Exact **duplicates** (same args/kwargs/result) are deduplicated.
+* Values are embedded using `repr(...)` in the generated code.
 
 ---
 
-## 🧩 Decorator mode (alternative to CLI)
+### `pytead tead` (all-in-one)
 
-You can also decorate the function directly:
+Trace **and** immediately generate tests in one go.
+
+```
+pytead tead [options] <module.function> [...] -- <script.py> [script args...]
+```
+
+**Extras**
+
+* `--pre-clean` — delete existing traces for targeted functions before tracing
+* `--pre-clean-before YYYY-MM-DD|ISO8601` — only delete older traces
+* `--gen-formats {pickle,json,repr}...` — restrict formats when reading for generation
+* `--only-targets` — generate tests **only** for the functions targeted in this command
+* `-o/--output` or `-d/--output-dir` — same as `gen` (defaults to a single file if neither is provided)
+
+---
+
+### `pytead clean`
+
+Delete trace files by function, pattern, format, and/or date. Examples:
+
+```bash
+
+# Narrow deletion to selected functions (exact names) and formats
+pytead clean --func mymodule.multiply --formats pickle json
+```
+
+Run `pytead clean -h` for the full set of options.
+
+---
+
+## 🧩 Decorator mode
+
+Prefer to trace without the CLI? Decorate directly:
 
 ```python
 from pytead import trace
@@ -126,9 +161,13 @@ def multiply(a, b):
     return a * b
 ```
 
-Running your program will then emit the same `.pkl` traces; generate tests with `pytead gen` as above.
+Run your program normally; traces will be written the same way. Then:
 
-You may also provide a custom serializer (+ a method to dump/read) :
+```bash
+pytead gen
+```
+
+### Custom storage example
 
 ```python
 from pathlib import Path
@@ -146,43 +185,42 @@ class MyJsonStorage:
         path.write_text(json.dumps(entry, default=str), encoding="utf-8")
 
     def load(self, path: Path) -> dict:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data
+        return json.loads(path.read_text(encoding="utf-8"))
 
 from pytead import trace
-@trace(storage_dir="call_logs", storage=MyJsonStorage())
-def f(x): ...
-    ...
 
+@trace(storage_dir="call_logs", storage=MyJsonStorage())
+def f(x):
+    ...
 ```
 
-# Configuration
+---
 
-Pytead reads optional configuration from TOML files. Command-line flags **always override** config values. Within a config file, section-specific values override `[defaults]`.
+## ⚙️ Configuration
 
-### Where pytead looks for config (in order)
+Pytead reads optional configuration from TOML files. **CLI flags always override** config values. Within a config file, a command section (e.g. `[run]`) overrides `[defaults]`.
 
-**Project-local** (searching upward from the current working directory):
-1. `./.pytead/default_config.toml`
-2. `./.pytead/config.toml`
+### Where Pytead looks for config (in order)
+
+**Project-local** (walk upward from the current working directory):
+
+1. `./.pytead/config.toml`
 
 **User-level** (fallbacks):
-1. `$PYTEAD_CONFIG` (explicit path, if set)
-2. `$XDG_CONFIG_HOME/pytead/config.toml`
-3. `~/.config/pytead/config.toml`
-4. `~/.pytead/config.toml`
 
-> Nearest project file wins over user-level files.
+1. `$PYTEAD_CONFIG` (explicit file path, or a directory containing `config.toml`)
+2. `$XDG_CONFIG_HOME/pytead/config.toml` (or `~/.config/pytead/config.toml`)
+3. `~/.pytead/config.toml`
+
+If no user/project config is found, Pytead loads the **packaged fallback**: `pytead/default_config.toml`.
 
 ### Precedence
 
 1. **CLI flags** (highest)
-2. Command section (e.g. `[run]`, `[gen]`, `[clean]`, `[tead]`)
+2. Section for the command (e.g. `[run]`, `[gen]`, `[clean]`, `[tead]`)
 3. `[defaults]` section
 
-### Example: project config
-
-Create `.pytead/default_config.toml` at your project root:
+### Example: project config (`.pytead/config.toml`)
 
 ```toml
 [defaults]
@@ -208,43 +246,51 @@ only_targets = true
 
 ---
 
-## 🛠️ How it works (design notes)
+## 🛠️ How it works
 
-* **Monkey‑patching**: `pytead run` imports the target module, wraps `module.function` with the decorator, and then runs your script. Your code calls the wrapped function transparently.
-* **Root‑call only**: a thread‑local depth counter ensures only the outermost invocation of the traced function is logged (avoids a storm of nested traces).
-* **Pickle traces**: by default, traces are saved as pickle files to keep Python types round‑trippable. Generation uses `repr(...)` to embed literals in test code.
-* **Parameterized tests**: for each traced function, tests are generated with `@pytest.mark.parametrize('args, kwargs, expected', [...])` and a single `assert func(*args, **kwargs) == expected`.
+* **Monkey-patching**: `pytead run/tead` imports your module, wraps `module.function` with the tracer, then runs your script. Your code calls the wrapped function transparently.
+* **Root-call only**: a thread-local depth counter ensures only the outermost invocation is logged.
+* **Trace formats**:
+
+  * **pickle** (default): safest for round-tripping Python types.
+  * **json**: portable; non-JSON types fall back to `repr(...)`.
+  * **repr**: human-readable Python literals; loaded via `ast.literal_eval`.
+* **Test generation**: tests import your function (`from pkg.mod import fn`) and assert `fn(*args, **kwargs) == expected` using parameterized cases.
 
 ---
 
-## ⚠️ Limitations & caveats (current state)
+## ⚠️ Limitations & caveats
 
-* **Methods / attributes**: the CLI targets `module.function` only; `module.Class.method` isn’t supported yet (workaround: decorate at definition site, or expose a module‑level wrapper and trace that).
-* **Side effects & exceptions**: not yet captured. Tests assume **pure** behavior (idempotent, no I/O or global state).
-* **Non‑reprable results**: generated code relies on `repr(...)`. Highly custom objects may not round‑trip. Prefer simple / JSON‑like data for now, or provide your own serializer.
-* **Flaky functions**: if a function is time‑ or randomness‑dependent, generated tests may fail nondeterministically.
+* **Methods / attributes**: CLI targets `module.function` only (no `module.Class.method` yet).
+* **Side-effects & exceptions**: not captured in the current version. Tests assume pure behavior.
+* **Non-repr-able results**: generated code relies on `repr(...)`. Complex/custom objects may not round-trip.
+* **Flaky functions**: time/random-dependent functions may yield nondeterministic tests.
+* **Multiprocess tracing**: `limit` is best-effort (no cross-process locking).
+* **Security**: trace files are **not** meant to be trusted input. Never load untrusted pickles.
 
 ---
 
 ## 🗺️ Roadmap
 
 * Capture **exceptions** and generate `with pytest.raises(...)` cases.
-* Opt‑in capture of **side‑effects** (stdout, file I/O summaries, env changes).
-* Support for **`module.Class.method`** targets in the CLI.
-* Pluggable **serialization** (JSON schema / jsonpickle) shipped in the CLI. -> in progress
-* Smarter **deduplication** 
-* Automatic detection of which unit tests fail even without code modification, because of randomness or uncontrolled dependencies, by calling pytest after run & gen, and rejection of these tests
-* **Doc enrichment**: promote real traces as runnable examples in docstrings / Markdown to aid LLM‑assisted code reading.
+* Opt-in capture of **side-effects** (stdout, file I/O summaries, env changes).
+* CLI support for **`module.Class.method`** targets.
+* Pluggable **serialization** (e.g., jsonpickle) in the CLI.
+* Smarter **deduplication** and flaky-test detection (auto-run pytest and discard unstable cases).
+* **Doc enrichment**: promote real traces as runnable examples in docstrings/Markdown.
 
 ---
 
 ## 🔗 Related tools & approaches
 
-* **Snapshot testing** (e.g., `pytest-snapshot`, `snapshottest`, `Syrupy`): good for pinning outputs in tests, but they don’t harvest *runtime inputs* from production runs.
-* **Synthetic test generation** (e.g., **Pynguin**): explores inputs for coverage, not based on *your* real executions.
-* **AOP / tracers** (e.g., `aspectlib`, `sys.settrace`): can intercept calls, but do not automatically emit ready‑to‑run pytest modules.
-* **Similar spirit elsewhere**: tools like **Keploy** (focus on external I/O) and some JS utilities (e.g., unit‑test recorders) share the trace‑to‑tests idea but target different layers.
+* **Snapshot testing** (`pytest-snapshot`, `snapshottest`, `Syrupy`): great for outputs, but don’t harvest runtime **inputs**.
+* **Synthetic test generation** (**Pynguin**): explores inputs for coverage, not based on your real executions.
+* **AOP / tracers** (`aspectlib`, `sys.settrace`): intercept calls but don’t emit ready-to-run pytest modules.
+* **Similar spirit**: **Keploy** (focus on external I/O) and various JS “record to unit test” tools.
 
 ---
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENCE)
+## 📝 License
+
+[MIT](LICENCE)
+

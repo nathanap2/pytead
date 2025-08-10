@@ -3,6 +3,7 @@ from typing import Any, Dict
 import argparse
 import logging
 import os
+import importlib.resources as ir
 
 # Exposed for debugging: where the config was loaded from (or None)
 LAST_CONFIG_PATH: Path | None = None
@@ -15,7 +16,6 @@ def _find_default_config(start: Path) -> Path | None:
     Search for a project-local or user-level config file.
 
     Project-local (searched upward from 'start'):
-      - .pytead/default_config.toml
       - .pytead/config.toml
 
     User-level (fallback):
@@ -29,14 +29,10 @@ def _find_default_config(start: Path) -> Path | None:
 
     # 1) Project-local, walking up parents
     for p in [cur, *cur.parents]:
-        cand = p / ".pytead" / "default_config.toml"
+        cand = p / ".pytead" / "config.toml"
         if cand.is_file():
             _log.info("  -> found config at %s", cand)
             return cand
-        cand_alt = p / ".pytead" / "config.toml"
-        if cand_alt.is_file():
-            _log.info("  -> found config at %s", cand_alt)
-            return cand_alt
 
     # 2) User-level overrides / fallbacks
     env_path = os.getenv("PYTEAD_CONFIG")
@@ -83,32 +79,22 @@ def _load_toml_text(txt: str) -> Dict[str, Any]:
     except Exception as exc:
         _log.warning("Failed to parse TOML with tomllib: %s", exc)
         return {}
-
-
+    
 def _load_default_config() -> Dict[str, Any]:
-    """
-    Load project config from default_config.toml if present.
-    Expected shape:
-      [defaults]
-      [run]
-      [gen]
-      [clean]
-      [tead]
-    """
     global LAST_CONFIG_PATH
     path = _find_default_config(Path.cwd())
-    LAST_CONFIG_PATH = path
-    if not path:
-        return {}
-    try:
+    if path:
+        LAST_CONFIG_PATH = path
         txt = path.read_text(encoding="utf-8")
-    except Exception as exc:
-        _log.warning("Failed to read %s: %s", path, exc)
+        return _load_toml_text(txt) or {}
+
+    try:
+        txt = ir.files("pytead").joinpath("default_config.toml").read_text(encoding="utf-8")
+        LAST_CONFIG_PATH = None  # explicite: fallback interne
+        return _load_toml_text(txt) or {}
+    except Exception:
         return {}
-    data = _load_toml_text(txt)
-    if not data:
-        _log.info("Config file %s parsed as empty or invalid.", path)
-    return data
+
 
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,8 +173,6 @@ def apply_config_from_default_file(cmd: str, args: argparse.Namespace) -> None:
     Additionally, if a field exists but is 'emptyish' (None, [], {}, or ""),
     fill it from config. This fixes the case where argparse created an empty list
     for positionals (e.g., 'targets') that should be provided by config.
-
-    Reads a single file: default_config.toml (project root or parent).
     """
     raw = _load_default_config()
     if not raw:

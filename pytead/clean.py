@@ -199,7 +199,7 @@ def run(args) -> None:
     )
 
 
-def add_subparser(subparsers) -> None:
+def add_clean_subparser(subparsers) -> None:
     """
     Register the `clean` subcommand.
 
@@ -215,14 +215,14 @@ def add_subparser(subparsers) -> None:
         "--calls-dir",
         type=Path,
         default=argparse.SUPPRESS,
-        help="directory containing trace files (default from config, else call_logs/)",
+        help="directory containing trace files",
     )
     p_clean.add_argument(
         "--formats",
         choices=["pickle", "json", "repr"],
         nargs="*",
         default=argparse.SUPPRESS,
-        help="restrict deletion to these formats (default: all detected)",
+        help="restrict deletion to these formats",
     )
     p_clean.add_argument(
         "--func",
