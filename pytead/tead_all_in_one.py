@@ -1,5 +1,4 @@
 import argparse
-import importlib
 import runpy
 import sys
 from pathlib import Path
@@ -16,6 +15,8 @@ from .config import (
     LAST_CONFIG_PATH,
 )
 from ._cli_utils import split_targets_and_cmd, unique_count, fallback_targets_from_cfg
+from ._targets import resolve_target
+import inspect
 
 
 def run(args) -> None:
@@ -71,7 +72,8 @@ def run(args) -> None:
 
     if not targets:
         logger.error(
-            "No target provided. Expect at least one 'module.function'. Config file used: %s",
+            "No target provided. Expect at least one 'module.function' or 'module.Class.method'. "
+            "Config file used: %s",
             LAST_CONFIG_PATH,
         )
         sys.exit(1)
@@ -110,23 +112,10 @@ def run(args) -> None:
     errors: List[str] = []
     for t in targets:
         try:
-            module_name, func_name = t.rsplit(".", 1)
-        except ValueError:
-            errors.append(f"Invalid target '{t}': expected format module.function")
-            continue
-        try:
-            module = importlib.import_module(module_name)
+            rt = resolve_target(t)  # supports module.func and module.Class.method
+            resolved.append((rt.owner, t, rt.kind))
         except Exception as exc:
-            errors.append(
-                f"Cannot import module '{module_name}' for target '{t}': {exc}"
-            )
-            continue
-        if not hasattr(module, func_name):
-            errors.append(
-                f"Function '{func_name}' not found in module '{module_name}' (target '{t}')"
-            )
-            continue
-        resolved.append((module, module_name, func_name))
+            errors.append(f"Cannot resolve target '{t}': {exc}")
 
     if errors:
         for m in errors:
@@ -134,21 +123,43 @@ def run(args) -> None:
         sys.exit(1)
 
     seen = set()
-    for module, module_name, func_name in resolved:
-        key = (module_name, func_name)
+    for owner, fq, kind in resolved:
+        key = fq
         if key in seen:
             continue
         seen.add(key)
-        wrapped = trace(
-            limit=args.limit,
-            storage_dir=storage_dir_abs,  # absolute path
-            storage=storage,
-        )(getattr(module, func_name))
-        setattr(module, func_name, wrapped)
+        name = fq.split(".")[-1]
+        raw = inspect.getattr_static(owner, name)
+
+        if isinstance(raw, staticmethod):
+            fn = raw.__func__
+            wrapped = trace(
+                limit=args.limit,
+                storage_dir=storage_dir_abs,  # absolute path
+                storage=storage,
+            )(fn)
+            setattr(owner, name, staticmethod(wrapped))
+        elif isinstance(raw, classmethod):
+            fn = raw.__func__
+            wrapped = trace(
+                limit=args.limit,
+                storage_dir=storage_dir_abs,
+                storage=storage,
+            )(fn)
+            setattr(owner, name, classmethod(wrapped))
+        else:
+            fn = getattr(owner, name)  # module-level or instance method function object
+            wrapped = trace(
+                limit=args.limit,
+                storage_dir=storage_dir_abs,
+                storage=storage,
+            )(fn)
+            setattr(owner, name, wrapped)
+
     logger.info(
-        "Instrumentation applied to %d function(s): %s",
+        "Instrumentation applied to %d target(s): %s",
         len(seen),
-        ", ".join(f"{m}.{f}" for (m, f) in seen),
+        ", ".join(sorted(seen)),
     )
 
     # 6) Execute the target script
@@ -249,7 +260,7 @@ def run(args) -> None:
 def add_tead_subparser(subparsers) -> None:
     p = subparsers.add_parser(
         "tead",
-        help="trace functions by running a script, then immediately generate pytest tests",
+        help="trace functions/methods by running a script, then immediately generate pytest tests",
     )
 
     # Instrumentation options (no hard-coded defaults here; let config fill them)
@@ -258,7 +269,7 @@ def add_tead_subparser(subparsers) -> None:
         "--limit",
         type=int,
         default=argparse.SUPPRESS,
-        help="max number of calls to record per function (default: 10)",
+        help="max number of calls to record per target (default: 10)",
     )
     p.add_argument(
         "-s",
@@ -288,7 +299,7 @@ def add_tead_subparser(subparsers) -> None:
         default=argparse.SUPPRESS,
         metavar="target",
         help=(
-            "one or more functions to trace, each in module.function format "
+            "one or more targets to trace: 'module.function' or 'module.Class.method' "
             "(may be provided via config [tead].targets)"
         ),
     )
@@ -344,3 +355,4 @@ def add_tead_subparser(subparsers) -> None:
     )
 
     p.set_defaults(handler=run)
+

@@ -31,7 +31,8 @@ def trace(
     st = storage or PickleStorage()
 
     def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-        fullname = f"{func.__module__}.{func.__name__}"
+        qual = getattr(func, "__qualname__", func.__name__)
+        fullname = f"{func.__module__}.{qual}"
         prefix = fullname.replace(".", "_")
 
         # Per-thread depth sentinel to detect root vs nested calls

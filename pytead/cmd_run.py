@@ -1,5 +1,4 @@
 import argparse
-import importlib
 import runpy
 import sys
 from pathlib import Path
@@ -14,25 +13,22 @@ from .config import (
     get_effective_config,
     LAST_CONFIG_PATH,
 )
+from ._targets import resolve_target
+import inspect
 
 
 def _handle(args: argparse.Namespace) -> None:
-    """Instrument one or more functions and run the target script."""
+    """Instrument one or more functions/methods and run the target script."""
     logger = configure_logger(name="pytead.cli.run")
 
-    # 0) Raw args
-    logger.info(
-        "RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)}
-    )
+    # 0) Raw args as parsed by argparse (before config injection)
+    logger.info("RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)})
 
-    # 1) Config injection (does NOT override explicit CLI flags)
+    # 1) Fill from default_config.toml (does NOT override explicit CLI flags)
     apply_config_from_default_file("run", args)
 
-    # 2) Effective args
-    logger.info(
-        "RUN: effective args (post-config): %s",
-        {k: getattr(args, k) for k in vars(args)},
-    )
+    # 2) Effective args after config
+    logger.info("RUN: effective args (post-config): %s", {k: getattr(args, k) for k in vars(args)})
 
     # 3) Validate required options (no in-code defaults here)
     missing = [k for k in ("limit", "storage_dir", "format") if not hasattr(args, k)]
@@ -48,7 +44,7 @@ def _handle(args: argparse.Namespace) -> None:
     effective_cfg = get_effective_config("run")
     logger.info("RUN: effective config snapshot: %s", effective_cfg or "{}")
 
-    # 4) Split positionals
+    # 4) Split positionals into targets and script command
     targets, cmd = split_targets_and_cmd(
         getattr(args, "targets", []) or [],
         getattr(args, "cmd", []),
@@ -60,7 +56,8 @@ def _handle(args: argparse.Namespace) -> None:
 
     if not targets:
         logger.error(
-            "No target provided. Expect at least one 'module.function'. Config file used: %s",
+            "No target provided. Expect at least one 'module.function' or 'module.Class.method'. "
+            "Config file used: %s",
             LAST_CONFIG_PATH,
         )
         sys.exit(1)
@@ -72,28 +69,16 @@ def _handle(args: argparse.Namespace) -> None:
     sys.path.insert(0, str(Path.cwd()))
     storage = get_storage(args.format)
 
-    # 6) Resolve and instrument
+    # 6) Resolve and instrument (descriptor-aware)
     resolved: List[Tuple[object, str, str]] = []
     errors: List[str] = []
+
     for t in targets:
         try:
-            module_name, func_name = t.rsplit(".", 1)
-        except ValueError:
-            errors.append(f"Invalid target '{t}': expected format module.function")
-            continue
-        try:
-            module = importlib.import_module(module_name)
+            rt = resolve_target(t)  # supports module.func and module.Class.method
+            resolved.append((rt.owner, t, rt.kind))
         except Exception as exc:
-            errors.append(
-                f"Cannot import module '{module_name}' for target '{t}': {exc}"
-            )
-            continue
-        if not hasattr(module, func_name):
-            errors.append(
-                f"Function '{func_name}' not found in module '{module_name}' (target '{t}')"
-            )
-            continue
-        resolved.append((module, module_name, func_name))
+            errors.append(f"Cannot resolve target '{t}': {exc}")
 
     if errors:
         for m in errors:
@@ -101,19 +86,33 @@ def _handle(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     seen = set()
-    for module, module_name, func_name in resolved:
-        key = (module_name, func_name)
+    for owner, fq, kind in resolved:
+        key = fq  # deduplicate on fully qualified target name
         if key in seen:
             continue
         seen.add(key)
-        wrapped = trace(
-            limit=args.limit, storage_dir=args.storage_dir, storage=storage
-        )(getattr(module, func_name))
-        setattr(module, func_name, wrapped)
+
+        name = fq.split(".")[-1]
+        raw = inspect.getattr_static(owner, name)
+
+        if isinstance(raw, staticmethod):
+            fn = raw.__func__
+            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            setattr(owner, name, staticmethod(wrapped))
+        elif isinstance(raw, classmethod):
+            fn = raw.__func__
+            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            setattr(owner, name, classmethod(wrapped))
+        else:
+            # Module-level function, or function stored on a class (instance method).
+            fn = getattr(owner, name)
+            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            setattr(owner, name, wrapped)
+
     logger.info(
-        "Instrumentation applied to %d function(s): %s",
+        "Instrumentation applied to %d target(s): %s",
         len(seen),
-        ", ".join(f"{m}.{f}" for (m, f) in seen),
+        ", ".join(sorted(seen)),
     )
 
     # 7) Execute the target script
@@ -133,7 +132,7 @@ def _handle(args: argparse.Namespace) -> None:
 def add_run_subparser(subparsers) -> None:
     p_run = subparsers.add_parser(
         "run",
-        help="instrument one or more functions and execute a Python script (use -- to separate targets from the script)",
+        help="instrument one or more functions/methods and execute a Python script (use -- to separate targets from the script)",
     )
     # No hard-coded defaults: config file fills missing values
     p_run.add_argument(
@@ -141,7 +140,7 @@ def add_run_subparser(subparsers) -> None:
         "--limit",
         type=int,
         default=argparse.SUPPRESS,
-        help="max number of calls to record per function",
+        help="max number of calls to record per target",
     )
     p_run.add_argument(
         "-s",
@@ -161,8 +160,10 @@ def add_run_subparser(subparsers) -> None:
         nargs="*",
         default=argparse.SUPPRESS,
         metavar="target",
-        help="one or more functions to trace, each in module.function format "
-        "(may be provided via config [run].targets)",
+        help=(
+            "one or more targets to trace: 'module.function' or 'module.Class.method' "
+            "(may be provided via config [run].targets)"
+        ),
     )
     p_run.add_argument(
         "cmd",
@@ -170,3 +171,4 @@ def add_run_subparser(subparsers) -> None:
         help="-- then the Python script to run (with arguments)",
     )
     p_run.set_defaults(handler=_handle)
+
