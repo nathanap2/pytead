@@ -28,8 +28,18 @@ def run(args) -> None:
         "TEAD: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)}
     )
 
-    # 1) Fill from default_config.toml (does NOT override explicit CLI flags)
-    apply_config_from_default_file("tead", args)
+    # 0bis) Prefer searching config from the script's directory if provided
+    start_hint = None
+    try:
+        for tok in (getattr(args, "cmd", []) or []):
+            if tok.endswith(".py"):
+                start_hint = Path(tok).resolve().parent
+                break
+    except Exception:
+        start_hint = None
+
+    # 1) Fill from default_config (does NOT override explicit CLI flags)
+    apply_config_from_default_file("tead", args, start=start_hint)
 
     # 1bis) Last-resort defaults (only if neither CLI nor config provided them)
     box = vars(args)
@@ -58,7 +68,7 @@ def run(args) -> None:
     )
 
     # Snapshot effective config for potential fallback of targets
-    effective_cfg = get_effective_config("tead")
+    effective_cfg = get_effective_config("tead", start=start_hint)
     logger.info("TEAD: effective config snapshot: %s", effective_cfg or "{}")
 
     # 3) Targets & command (robust split; '.py' tokens move to cmd)

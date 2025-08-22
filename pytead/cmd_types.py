@@ -13,7 +13,9 @@ from .gen_types import summarize_function_types, group_by_module, render_stub_mo
 
 def _handle(args: argparse.Namespace) -> None:
     log = configure_logger(name="pytead.cli.types")
-    apply_config_from_default_file("types", args)
+    # If the user provides --project-root, use it as discovery root for config
+    project_root = Path(getattr(args, "project_root", Path.cwd()))
+    apply_config_from_default_file("types", args, start=project_root)
 
     # --- NEW: rendre le repo importable ---
     import sys

@@ -24,8 +24,18 @@ def _handle(args: argparse.Namespace) -> None:
     # 0) Raw args as parsed by argparse (before config injection)
     logger.info("RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)})
 
-    # 1) Fill from default_config.toml (does NOT override explicit CLI flags)
-    apply_config_from_default_file("run", args)
+    # 0bis) Prefer searching config from the script's directory if provided
+    start_hint = None
+    try:
+        for tok in (getattr(args, "cmd", []) or []):
+            if tok.endswith(".py"):
+                start_hint = Path(tok).resolve().parent
+                break
+    except Exception:
+        start_hint = None
+
+    # 1) Fill from default_config (does NOT override explicit CLI flags)
+    apply_config_from_default_file("run", args, start=start_hint)
 
     # 2) Effective args after config
     logger.info("RUN: effective args (post-config): %s", {k: getattr(args, k) for k in vars(args)})
@@ -35,13 +45,13 @@ def _handle(args: argparse.Namespace) -> None:
     if missing:
         logger.error(
             "Missing required options for 'run': %s. "
-            "Set them in [defaults]/[run] of .pytead/config.toml or pass flags.",
+            "Set them in [defaults]/[run] of .pytead/config.(toml|yaml) or pass flags.",
             ", ".join(missing),
         )
         sys.exit(1)
 
     # Snapshot effective config for potential fallback of targets
-    effective_cfg = get_effective_config("run")
+    effective_cfg = get_effective_config("run", start=start_hint)
     logger.info("RUN: effective config snapshot: %s", effective_cfg or "{}")
 
     # 4) Split positionals into targets and script command
@@ -127,6 +137,7 @@ def _handle(args: argparse.Namespace) -> None:
     except Exception as exc:
         logger.error("Error during script execution: %s", exc)
         sys.exit(1)
+
 
 
 def add_run_subparser(subparsers) -> None:
