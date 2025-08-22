@@ -312,11 +312,20 @@ def run(args) -> None:
         "TEAD: found %d function(s), %d unique case(s).", len(entries), total_unique
     )
 
+    # --- Import roots insérés dans les fichiers de tests (portables) ---
+    gen_extra = getattr(args, "additional_sys_path", None)
+    if not gen_extra:
+        gen_extra = (effective_tead or {}).get("additional_sys_path")
+    if not gen_extra:
+        gen_extra = (effective_run or {}).get("additional_sys_path")
+    import_roots_for_tests = ["."]
+    import_roots_for_tests += [str(p) for p in (gen_extra or [])]
+
     if out_dir is not None:
-        write_tests_per_func(entries, out_dir)
+        write_tests_per_func(entries, out_dir, import_roots=import_roots_for_tests)
         logger.info("TEAD: generated %d test modules in '%s'.", len(entries), out_dir)
     else:
-        source = render_tests(entries)
+        source = render_tests(entries, import_roots=import_roots_for_tests)
         write_tests(source, out_file)
         logger.info(
             "TEAD: generated '%s' with %d unique tests.", out_file, total_unique
@@ -421,3 +430,4 @@ def add_tead_subparser(subparsers) -> None:
     )
 
     p.set_defaults(handler=run)
+
