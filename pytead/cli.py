@@ -5,6 +5,7 @@ from .cmd_run import add_run_subparser
 from .cmd_gen import add_gen_subparser
 from .clean import add_clean_subparser
 from .tead_all_in_one import add_tead_subparser
+from .cmd_types import add_types_subparser
 
 
 def main() -> None:
@@ -16,6 +17,7 @@ def main() -> None:
     add_gen_subparser(subparsers)
     add_clean_subparser(subparsers)
     add_tead_subparser(subparsers)
+    add_types_subparser(subparsers)
 
     args = parser.parse_args()
     args.handler(args)
@@ -23,4 +25,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

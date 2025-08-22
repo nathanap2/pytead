@@ -79,7 +79,8 @@ def _load_toml_text(txt: str) -> Dict[str, Any]:
     except Exception as exc:
         _log.warning("Failed to parse TOML with tomllib: %s", exc)
         return {}
-    
+
+
 def _load_default_config() -> Dict[str, Any]:
     global LAST_CONFIG_PATH
     path = _find_default_config(Path.cwd())
@@ -89,12 +90,15 @@ def _load_default_config() -> Dict[str, Any]:
         return _load_toml_text(txt) or {}
 
     try:
-        txt = ir.files("pytead").joinpath("default_config.toml").read_text(encoding="utf-8")
+        txt = (
+            ir.files("pytead")
+            .joinpath("default_config.toml")
+            .read_text(encoding="utf-8")
+        )
         LAST_CONFIG_PATH = None  # explicite: fallback interne
         return _load_toml_text(txt) or {}
     except Exception:
         return {}
-
 
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:

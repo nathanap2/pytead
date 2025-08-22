@@ -21,13 +21,18 @@ def _handle(args: argparse.Namespace) -> None:
     logger = configure_logger(name="pytead.cli.run")
 
     # 0) Raw args
-    logger.info("RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)})
+    logger.info(
+        "RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)}
+    )
 
     # 1) Config injection (does NOT override explicit CLI flags)
     apply_config_from_default_file("run", args)
 
     # 2) Effective args
-    logger.info("RUN: effective args (post-config): %s", {k: getattr(args, k) for k in vars(args)})
+    logger.info(
+        "RUN: effective args (post-config): %s",
+        {k: getattr(args, k) for k in vars(args)},
+    )
 
     # 3) Validate required options (no in-code defaults here)
     missing = [k for k in ("limit", "storage_dir", "format") if not hasattr(args, k)]
@@ -79,10 +84,14 @@ def _handle(args: argparse.Namespace) -> None:
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:
-            errors.append(f"Cannot import module '{module_name}' for target '{t}': {exc}")
+            errors.append(
+                f"Cannot import module '{module_name}' for target '{t}': {exc}"
+            )
             continue
         if not hasattr(module, func_name):
-            errors.append(f"Function '{func_name}' not found in module '{module_name}' (target '{t}')")
+            errors.append(
+                f"Function '{func_name}' not found in module '{module_name}' (target '{t}')"
+            )
             continue
         resolved.append((module, module_name, func_name))
 
@@ -97,9 +106,9 @@ def _handle(args: argparse.Namespace) -> None:
         if key in seen:
             continue
         seen.add(key)
-        wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(
-            getattr(module, func_name)
-        )
+        wrapped = trace(
+            limit=args.limit, storage_dir=args.storage_dir, storage=storage
+        )(getattr(module, func_name))
         setattr(module, func_name, wrapped)
     logger.info(
         "Instrumentation applied to %d function(s): %s",
@@ -127,16 +136,37 @@ def add_run_subparser(subparsers) -> None:
         help="instrument one or more functions and execute a Python script (use -- to separate targets from the script)",
     )
     # No hard-coded defaults: config file fills missing values
-    p_run.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS,
-                       help="max number of calls to record per function")
-    p_run.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS,
-                       help="directory to store trace files")
-    p_run.add_argument("--format", choices=["pickle", "json", "repr"], default=argparse.SUPPRESS,
-                       help="trace storage format")
-    p_run.add_argument("targets", nargs="*", default=argparse.SUPPRESS, metavar="target",
-                       help="one or more functions to trace, each in module.function format "
-                            "(may be provided via config [run].targets)")
-    p_run.add_argument("cmd", nargs=argparse.REMAINDER,
-                       help="-- then the Python script to run (with arguments)")
+    p_run.add_argument(
+        "-l",
+        "--limit",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="max number of calls to record per function",
+    )
+    p_run.add_argument(
+        "-s",
+        "--storage-dir",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="directory to store trace files",
+    )
+    p_run.add_argument(
+        "--format",
+        choices=["pickle", "json", "repr"],
+        default=argparse.SUPPRESS,
+        help="trace storage format",
+    )
+    p_run.add_argument(
+        "targets",
+        nargs="*",
+        default=argparse.SUPPRESS,
+        metavar="target",
+        help="one or more functions to trace, each in module.function format "
+        "(may be provided via config [run].targets)",
+    )
+    p_run.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        help="-- then the Python script to run (with arguments)",
+    )
     p_run.set_defaults(handler=_handle)
-

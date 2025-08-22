@@ -1,6 +1,3 @@
-# pytead/pytead/cmd_gen.py
-from __future__ import annotations
-
 import argparse
 import sys
 from pathlib import Path
@@ -38,10 +35,14 @@ def _handle(args: argparse.Namespace) -> None:
 
     calls_dir = Path(calls_dir)
     if not calls_dir.exists() or not calls_dir.is_dir():
-        logger.error("Calls directory '%s' does not exist or is not a directory", calls_dir)
+        logger.error(
+            "Calls directory '%s' does not exist or is not a directory", calls_dir
+        )
         sys.exit(1)
 
-    entries: Dict[str, List[dict]] = collect_entries(calls_dir=calls_dir, formats=formats)
+    entries: Dict[str, List[dict]] = collect_entries(
+        calls_dir=calls_dir, formats=formats
+    )
     total_unique = unique_count(entries)
 
     if output_dir is not None:
@@ -60,14 +61,34 @@ def _handle(args: argparse.Namespace) -> None:
 
 def add_gen_subparser(subparsers) -> None:
     p_gen = subparsers.add_parser("gen", help="generate pytest tests from traces")
-    p_gen.add_argument("-c", "--calls-dir", type=Path, default=argparse.SUPPRESS,
-                       help="directory containing trace files")
+    p_gen.add_argument(
+        "-c",
+        "--calls-dir",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="directory containing trace files",
+    )
     group = p_gen.add_mutually_exclusive_group()
-    group.add_argument("-o", "--output", type=Path, default=argparse.SUPPRESS,
-                       help="single-file output for generated tests")
-    group.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS,
-                       help="write one test module per function in this directory")
-    p_gen.add_argument("--formats", choices=["pickle", "json", "repr"], nargs="*",
-                       default=argparse.SUPPRESS, help="restrict to these formats when reading")
+    group.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="single-file output for generated tests",
+    )
+    group.add_argument(
+        "-d",
+        "--output-dir",
+        dest="output_dir",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="write one test module per function in this directory",
+    )
+    p_gen.add_argument(
+        "--formats",
+        choices=["pickle", "json", "repr"],
+        nargs="*",
+        default=argparse.SUPPRESS,
+        help="restrict to these formats when reading",
+    )
     p_gen.set_defaults(handler=_handle)
-

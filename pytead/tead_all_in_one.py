@@ -17,6 +17,7 @@ from .config import (
 )
 from ._cli_utils import split_targets_and_cmd, unique_count, fallback_targets_from_cfg
 
+
 def run(args) -> None:
     """End-to-end: trace targets while running a script, then generate pytest tests."""
     logger = configure_logger(name="pytead.tead")

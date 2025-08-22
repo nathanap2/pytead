@@ -23,6 +23,10 @@ def _key_to_literal(k: Any) -> Any:
 
 
 def _to_literal(obj: Any) -> Any:
+    """
+    Convert an arbitrary object into a structure composed only
+    of literal types (str, int, float, bool, None, list, tuple, dict).
+    """
     if isinstance(obj, tuple):
         return tuple(_to_literal(x) for x in obj)
     if isinstance(obj, list):

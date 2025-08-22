@@ -9,3 +9,6 @@ limit = 7
 [gen]
 output_dir = "tests/generated"
 
+[types]
+calls_dir = "call_logs"
+out_dir = "typings"

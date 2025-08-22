@@ -198,27 +198,12 @@ def f(x):
 
 ## ⚙️ Configuration
 
-Pytead reads optional configuration from TOML files. **CLI flags always override** config values. Within a config file, a command section (e.g. `[run]`) overrides `[defaults]`.
+### Where Pytead looks for config, and what is the priority order
 
-### Where Pytead looks for config (in order)
+Your config is in `./.pytead/config.toml` or `~/.config/pytead/config.toml` by default (you can change it with `$PYTEAD_CONFIG`).
 
-**Project-local** (walk upward from the current working directory):
+CLI flags > [section] for the command in your config > [defaults] section in your config > [section] in packaged fallback > [defaults] in packaged fallback
 
-1. `./.pytead/config.toml`
-
-**User-level** (fallbacks):
-
-1. `$PYTEAD_CONFIG` (explicit file path, or a directory containing `config.toml`)
-2. `$XDG_CONFIG_HOME/pytead/config.toml` (or `~/.config/pytead/config.toml`)
-3. `~/.pytead/config.toml`
-
-If no user/project config is found, Pytead loads the **packaged fallback**: `pytead/default_config.toml`.
-
-### Precedence
-
-1. **CLI flags** (highest)
-2. Section for the command (e.g. `[run]`, `[gen]`, `[clean]`, `[tead]`)
-3. `[defaults]` section
 
 ### Example: project config (`.pytead/config.toml`)
 
@@ -246,19 +231,6 @@ only_targets = true
 
 ---
 
-## 🛠️ How it works
-
-* **Monkey-patching**: `pytead run/tead` imports your module, wraps `module.function` with the tracer, then runs your script. Your code calls the wrapped function transparently.
-* **Root-call only**: a thread-local depth counter ensures only the outermost invocation is logged.
-* **Trace formats**:
-
-  * **pickle** (default): safest for round-tripping Python types.
-  * **json**: portable; non-JSON types fall back to `repr(...)`.
-  * **repr**: human-readable Python literals; loaded via `ast.literal_eval`.
-* **Test generation**: tests import your function (`from pkg.mod import fn`) and assert `fn(*args, **kwargs) == expected` using parameterized cases.
-
----
-
 ## ⚠️ Limitations & caveats
 
 * **Methods / attributes**: CLI targets `module.function` only (no `module.Class.method` yet).
@@ -266,7 +238,6 @@ only_targets = true
 * **Non-repr-able results**: generated code relies on `repr(...)`. Complex/custom objects may not round-trip.
 * **Flaky functions**: time/random-dependent functions may yield nondeterministic tests.
 * **Multiprocess tracing**: `limit` is best-effort (no cross-process locking).
-* **Security**: trace files are **not** meant to be trusted input. Never load untrusted pickles.
 
 ---
 
@@ -277,14 +248,15 @@ only_targets = true
 * CLI support for **`module.Class.method`** targets.
 * Pluggable **serialization** (e.g., jsonpickle) in the CLI.
 * Smarter **deduplication** and flaky-test detection (auto-run pytest and discard unstable cases).
-* **Doc enrichment**: promote real traces as runnable examples in docstrings/Markdown.
+* **Doc enrichment**: promote real traces as runnable examples in docstrings/Markdown. 
 
 ---
 
 ## 🔗 Related tools & approaches
 
 * **Snapshot testing** (`pytest-snapshot`, `snapshottest`, `Syrupy`): great for outputs, but don’t harvest runtime **inputs**.
-* **Synthetic test generation** (**Pynguin**): explores inputs for coverage, not based on your real executions.
+* **Synthetic test generation** : Pynguin, for instance, explores inputs for coverage, but it's not based on your real executions.
+* **Automatic type inference** : Monkeytype use runtime to guess types (but we aim to make a more versatile tool oriented towards reading and subsequent modification of the code by agents) 
 * **AOP / tracers** (`aspectlib`, `sys.settrace`): intercept calls but don’t emit ready-to-run pytest modules.
 * **Similar spirit**: **Keploy** (focus on external I/O) and various JS “record to unit test” tools.
 
