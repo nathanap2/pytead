@@ -68,24 +68,26 @@ class PickleStorage(_BaseStorage):
                 pickle.dump(entry, f)
         except Exception as exc:
             log.error("Failed to write pickle %s: %s", path, exc)
-            
+
     def dump(self, entry: Dict[str, Any], path: Path) -> None:
         import os, tempfile
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(path.parent)) as tmp:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=str(path.parent)
+            ) as tmp:
                 pickle.dump(entry, tmp)
                 tmp_name = tmp.name
             os.replace(tmp_name, path)  # atomic on POSIX
         except Exception as exc:
             try:
                 # Cleanup temp if any
-                if 'tmp_name' in locals():
+                if "tmp_name" in locals():
                     os.unlink(tmp_name)
             except Exception:
                 pass
             log.error("Failed to write pickle %s: %s", path, exc)
-
 
     def load(self, path: Path) -> Dict[str, Any]:
         with path.open("rb") as f:

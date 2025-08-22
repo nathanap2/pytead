@@ -213,6 +213,13 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
                 out["targets"] = [str(x) for x in val]
             except TypeError:
                 out["targets"] = [str(val)]
+    # additional_sys_path: normalise en list[str] (résolution absolue côté CLI)
+    if "additional_sys_path" in out and out["additional_sys_path"] is not None:
+        v = out["additional_sys_path"]
+        if isinstance(v, (str, Path)):
+            out["additional_sys_path"] = [str(v)]
+        else:
+            out["additional_sys_path"] = [str(x) for x in v]
 
     return out
 
@@ -271,4 +278,3 @@ def get_effective_config(cmd: str, start: Path | None = None) -> Dict[str, Any]:
         _log.info("get_effective_config(%s): no config file found.", cmd)
         return {}
     return _effective(cmd, raw)
-

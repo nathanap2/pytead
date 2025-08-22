@@ -22,7 +22,11 @@ def _qualtype(obj: Any) -> str:
     """Return a readable fully-qualified type name for an instance."""
     t = type(obj)
     name = getattr(t, "__qualname__", getattr(t, "__name__", str(t)))
-    return f"{t.__module__}.{name}" if t.__module__ and t.__module__ != "builtins" else name
+    return (
+        f"{t.__module__}.{name}"
+        if t.__module__ and t.__module__ != "builtins"
+        else name
+    )
 
 
 def _iter_slots(cls: type) -> list[str]:
@@ -139,10 +143,9 @@ def trace(
         try:
             sig = inspect.signature(fn)
             params = list(sig.parameters.values())
-            has_pos0 = (
-                len(params) >= 1
-                and params[0].kind
-                in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+            has_pos0 = len(params) >= 1 and params[0].kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
             )
             first_name = params[0].name if has_pos0 else None
         except Exception:
@@ -190,22 +193,32 @@ def trace(
                     try:
                         if pub_before is not None and len(args) >= 1:
                             try:
-                                pub_after = _snapshot_object(args[0], include_private=False)
-                                all_after = _snapshot_object(args[0], include_private=True)
+                                pub_after = _snapshot_object(
+                                    args[0], include_private=False
+                                )
+                                all_after = _snapshot_object(
+                                    args[0], include_private=True
+                                )
                             except Exception:
                                 pub_after = all_after = None
 
                         nonlocal initialized, written
                         with counter_lock:
                             if not initialized:
-                                existing = list(storage_path.glob(f"{prefix}__*{st.extension}"))
+                                existing = list(
+                                    storage_path.glob(f"{prefix}__*{st.extension}")
+                                )
                                 written = len(existing)
                                 initialized = True
 
                             if written < limit:
                                 # Keep bound arg only for JSON/REPR; drop for Pickle.
                                 is_pickle = isinstance(st, PickleStorage)
-                                stored_args = args[1:] if (is_pickle and drop_first and len(args) >= 1) else args
+                                stored_args = (
+                                    args[1:]
+                                    if (is_pickle and drop_first and len(args) >= 1)
+                                    else args
+                                )
 
                                 entry: Dict[str, Any] = {
                                     "trace_schema": "pytead/v1",
@@ -213,7 +226,10 @@ def trace(
                                     "args": stored_args,
                                     "kwargs": kwargs,
                                     "result": result,
-                                    "timestamp": datetime.utcnow().isoformat(timespec="microseconds") + "Z",
+                                    "timestamp": datetime.utcnow().isoformat(
+                                        timespec="microseconds"
+                                    )
+                                    + "Z",
                                 }
                                 if pub_before is not None:
                                     entry["self"] = {
@@ -260,4 +276,3 @@ def trace(
         return _build_wrapper(func)
 
     return decorator
-

@@ -141,8 +141,6 @@ def test_project_config_wins_even_if_env_is_set(tmp_path: Path, monkeypatch):
 
     found = _find_default_config(Path.cwd())
     assert found == chosen
-    
-    
 
 
 import os
@@ -154,6 +152,7 @@ from pathlib import Path
 import pytest
 
 # --- Helpers -----------------------------------------------------------------
+
 
 def _write(p: Path, s: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +224,7 @@ def _make_min_repo_with_yaml(repo: Path) -> Path:
 
 # --- Tests -------------------------------------------------------------------
 
+
 def test_run_uses_script_dir_for_config_toml(tmp_path, monkeypatch, caplog):
     """
     Ensure cmd_run._handle discovers .pytead/config.toml starting from the script directory,
@@ -246,18 +246,24 @@ def test_run_uses_script_dir_for_config_toml(tmp_path, monkeypatch, caplog):
 
     # Patch tracing.trace to a no-op decorator to avoid file I/O during instrumentation
     import pytead.cmd_run as cmd_run
+
     def _noop_trace(**_kwargs):
         def _dec(fn):
             return fn
+
         return _dec
+
     monkeypatch.setattr(cmd_run, "trace", _noop_trace, raising=True)
 
     # Build a Namespace mimicking argparse output: no CLI-provided config; only the script path in cmd.
     class NS:
         pass
+
     args = NS()
-    args.targets = []     # empty → should fallback to config [run].targets
-    args.cmd = [str(script_path)]  # what argparse.REMAINDER would give (no leading '--')
+    args.targets = []  # empty → should fallback to config [run].targets
+    args.cmd = [
+        str(script_path)
+    ]  # what argparse.REMAINDER would give (no leading '--')
 
     # Run from "outside"
     old_cwd = Path.cwd()
@@ -265,11 +271,13 @@ def test_run_uses_script_dir_for_config_toml(tmp_path, monkeypatch, caplog):
         os.chdir(outside)
         # Import here to get LAST_CONFIG_PATH
         from pytead.config import LAST_CONFIG_PATH
+
         # Execute handler; should load config from repo/.pytead/config.toml thanks to start_hint
         cmd_run._handle(args)
 
         # Assert that the config file used is the repo one
         from pytead import config as _cfgmod  # re-import to read the mutated global
+
         assert _cfgmod.LAST_CONFIG_PATH == config_path
 
         # Optional: check logs mention instrumentation and the target name
@@ -341,4 +349,3 @@ def test_env_yaml_via_pytead_config(tmp_path, monkeypatch):
     assert getattr(args, "storage_dir", None) == Path("ucalls")
     assert getattr(args, "format", None) == "repr"
     assert getattr(args, "targets", None) == ["pkg.mod.fn"]
-

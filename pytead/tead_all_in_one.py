@@ -31,7 +31,7 @@ def run(args) -> None:
     # 0bis) Prefer searching config from the script's directory if provided
     start_hint = None
     try:
-        for tok in (getattr(args, "cmd", []) or []):
+        for tok in getattr(args, "cmd", []) or []:
             if tok.endswith(".py"):
                 start_hint = Path(tok).resolve().parent
                 break
@@ -67,9 +67,10 @@ def run(args) -> None:
         Path(args.calls_dir).resolve() if args.calls_dir else storage_dir_abs
     )
 
-    # Snapshot effective config for potential fallback of targets
-    effective_cfg = get_effective_config("tead", start=start_hint)
-    logger.info("TEAD: effective config snapshot: %s", effective_cfg or "{}")
+    # Snapshot effective configs (tead + run) pour gérer le fallback des targets et des paths
+    effective_tead = get_effective_config("tead", start=start_hint)
+    effective_run = get_effective_config("run", start=start_hint)
+    logger.info("TEAD: effective config snapshot: %s", effective_tead or "{}")
 
     # 3) Targets & command (robust split; '.py' tokens move to cmd)
     targets, cmd = split_targets_and_cmd(
@@ -77,8 +78,51 @@ def run(args) -> None:
     )
     logger.info("TEAD: split targets=%s cmd=%s", targets, cmd)
 
-    # Fallback: if targets ended up empty (e.g., a *.py was moved to cmd), let config supply them.
-    targets = fallback_targets_from_cfg(targets, effective_cfg, logger, "TEAD")
+    # 3bis) Préparer sys.path (dossier du script, racine du projet, puis additional_sys_path)
+    from .config import LAST_CONFIG_PATH
+
+    import_roots: list[Path] = []
+
+    # a) Dossier du script
+    if cmd and cmd[0].endswith(".py"):
+        script_dir = Path(cmd[0]).resolve().parent
+        import_roots.append(script_dir)
+
+    # b) Racine du projet
+    if LAST_CONFIG_PATH is not None:
+        cfg_dir = LAST_CONFIG_PATH.parent
+        project_root = cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
+    else:
+        project_root = Path.cwd()
+    import_roots.append(project_root.resolve())
+
+    # c) additional_sys_path : args -> [tead] -> [run]
+    extra = getattr(args, "additional_sys_path", None)
+    if not extra:
+        extra = (effective_tead or {}).get("additional_sys_path")
+    if not extra:
+        extra = (effective_run or {}).get("additional_sys_path")
+    for p in extra or []:
+        pp = Path(p)
+        abs_p = (project_root / pp).resolve() if not pp.is_absolute() else pp.resolve()
+        import_roots.append(abs_p)
+
+    # Injection (priorité: script dir, project root, extras), dédup + existence
+    for root in [str(p) for p in import_roots if p.exists()]:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+
+    # Fallback 1 : si pas de cibles en CLI → prendre [tead].targets
+    targets = fallback_targets_from_cfg(targets, effective_tead, logger, "TEAD")
+    # Fallback 2 : si toujours vide → retomber sur [run].targets
+    if not targets:
+        run_targets = (effective_run or {}).get("targets")
+        if run_targets:
+            logger.info(
+                "TEAD: no CLI targets and none in [tead]; falling back to [run].targets: %s",
+                run_targets,
+            )
+            targets = list(run_targets)
 
     if not targets:
         logger.error(
@@ -91,10 +135,12 @@ def run(args) -> None:
         logger.error("No script specified after '--'")
         sys.exit(1)
 
-    sys.path.insert(0, str(caller_cwd))
+    # 4) Prépare storage backend
+    if str(caller_cwd) not in sys.path:
+        sys.path.insert(0, str(caller_cwd))
     storage = get_storage(args.format)
 
-    # 4) Optional pre-clean (in ABSOLUTE calls dir)
+    # 5) Optional pre-clean (in ABSOLUTE calls dir)
     if args.pre_clean:
         to_delete, total_bytes = _plan_deletions(
             calls_dir=calls_dir_abs,
@@ -117,7 +163,7 @@ def run(args) -> None:
                 calls_dir_abs,
             )
 
-    # 5) Instrumentation (write to ABSOLUTE storage_dir)
+    # 6) Instrumentation (write to ABSOLUTE storage_dir)
     resolved: List[Tuple[Any, str, str]] = []
     errors: List[str] = []
     for t in targets:
@@ -145,7 +191,7 @@ def run(args) -> None:
             fn = raw.__func__
             wrapped = trace(
                 limit=args.limit,
-                storage_dir=storage_dir_abs,  # absolute path
+                storage_dir=storage_dir_abs,
                 storage=storage,
             )(fn)
             setattr(owner, name, staticmethod(wrapped))
@@ -158,7 +204,7 @@ def run(args) -> None:
             )(fn)
             setattr(owner, name, classmethod(wrapped))
         else:
-            fn = getattr(owner, name)  # module-level or instance method function object
+            fn = getattr(owner, name)
             wrapped = trace(
                 limit=args.limit,
                 storage_dir=storage_dir_abs,
@@ -172,7 +218,7 @@ def run(args) -> None:
         ", ".join(sorted(seen)),
     )
 
-    # 6) Execute the target script
+    # 7) Execute the target script
     script = cmd[0]
     if not script.endswith(".py"):
         logger.error("Unsupported script '%s': only .py files are allowed", script)
@@ -196,7 +242,7 @@ def run(args) -> None:
         # Keep going: generate tests from whatever was traced
         logger.error("Target script terminated: %r — continuing to generation.", exc)
 
-    # 7) Generate tests from ABSOLUTE calls dir
+    # 8) Generate tests from ABSOLUTE calls dir
     out_file = getattr(args, "output", None)
     out_dir = getattr(args, "output_dir", None)
     if out_file is None and out_dir is None:
@@ -212,6 +258,14 @@ def run(args) -> None:
         "TEAD: scanning traces in %s (formats=%s)...", calls_dir_abs, gen_formats
     )
 
+    # Si le répertoire de traces n'existe pas (ex.: script no-op en test), on sort proprement.
+    if not calls_dir_abs.exists():
+        logger.info(
+            "TEAD: calls dir '%s' does not exist yet; skipping generation.",
+            calls_dir_abs,
+        )
+        return
+
     # Debug: how many files match?
     candidates = []
     for st in storages_from_names(gen_formats):
@@ -222,12 +276,14 @@ def run(args) -> None:
         [st.extension for st in storages_from_names(gen_formats)],
     )
 
-    # Read entries
-    try:
-        entries = collect_entries(calls_dir=calls_dir_abs, formats=gen_formats)
-    except Exception as exc:
-        logger.error("Failed to collect entries: %r", exc)
-        entries = {}
+    def _try_collect(fmt):
+        try:
+            return collect_entries(calls_dir=calls_dir_abs, formats=fmt)
+        except Exception as exc:
+            logger.error("Failed to collect entries in %s: %r", calls_dir_abs, exc)
+            return {}
+
+    entries = _try_collect(gen_formats)
 
     if not entries:
         logger.warning(
@@ -235,7 +291,7 @@ def run(args) -> None:
             calls_dir_abs,
             gen_formats,
         )
-        entries = collect_entries(calls_dir=calls_dir_abs, formats=None)
+        entries = _try_collect(None)
         if not entries:
             logger.warning(
                 "TEAD: still no traces after auto-detect — aborting generation."
@@ -365,4 +421,3 @@ def add_tead_subparser(subparsers) -> None:
     )
 
     p.set_defaults(handler=run)
-

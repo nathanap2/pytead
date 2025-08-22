@@ -22,12 +22,14 @@ def _handle(args: argparse.Namespace) -> None:
     logger = configure_logger(name="pytead.cli.run")
 
     # 0) Raw args as parsed by argparse (before config injection)
-    logger.info("RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)})
+    logger.info(
+        "RUN: raw args (pre-config): %s", {k: getattr(args, k) for k in vars(args)}
+    )
 
     # 0bis) Prefer searching config from the script's directory if provided
     start_hint = None
     try:
-        for tok in (getattr(args, "cmd", []) or []):
+        for tok in getattr(args, "cmd", []) or []:
             if tok.endswith(".py"):
                 start_hint = Path(tok).resolve().parent
                 break
@@ -38,7 +40,10 @@ def _handle(args: argparse.Namespace) -> None:
     apply_config_from_default_file("run", args, start=start_hint)
 
     # 2) Effective args after config
-    logger.info("RUN: effective args (post-config): %s", {k: getattr(args, k) for k in vars(args)})
+    logger.info(
+        "RUN: effective args (post-config): %s",
+        {k: getattr(args, k) for k in vars(args)},
+    )
 
     # 3) Validate required options (no in-code defaults here)
     missing = [k for k in ("limit", "storage_dir", "format") if not hasattr(args, k)]
@@ -61,6 +66,37 @@ def _handle(args: argparse.Namespace) -> None:
     )
     logger.info("RUN: split targets=%s cmd=%s", targets, cmd)
 
+    # 4bis) Préparer sys.path pour reproduire l'environnement d'exécution
+    # - Ajoute en tête: dossier du script (si fourni), puis racine du projet,
+    # - puis [run].additional_sys_path (résolus relativement à la racine du projet).
+    from .config import LAST_CONFIG_PATH
+
+    import_roots: list[Path] = []
+
+    # a) Dossier du script
+    if cmd and cmd[0].endswith(".py"):
+        script_dir = Path(cmd[0]).resolve().parent
+        import_roots.append(script_dir)
+
+    # b) Racine du projet (parent de ".pytead" si config projet ; sinon dossier du fichier de config ; sinon CWD)
+    if LAST_CONFIG_PATH is not None:
+        cfg_dir = LAST_CONFIG_PATH.parent
+        project_root = cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
+    else:
+        project_root = Path.cwd()
+    import_roots.append(project_root.resolve())
+
+    # c) Chemins additionnels
+    for p in getattr(args, "additional_sys_path", []) or []:
+        pp = Path(p)
+        abs_p = (project_root / pp).resolve() if not pp.is_absolute() else pp.resolve()
+        import_roots.append(abs_p)
+
+    # Injection en respectant l'ordre et en dédupliquant
+    for root in [str(p) for p in import_roots if p.exists()]:
+        if root not in sys.path:
+            sys.path.insert(0, root)
+
     # Fallback to config-provided targets if empty
     targets = fallback_targets_from_cfg(targets, effective_cfg, logger, "RUN")
 
@@ -76,7 +112,8 @@ def _handle(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     # 5) Prepare import path and storage backend
-    sys.path.insert(0, str(Path.cwd()))
+    if str(Path.cwd()) not in sys.path:
+        sys.path.insert(0, str(Path.cwd()))
     storage = get_storage(args.format)
 
     # 6) Resolve and instrument (descriptor-aware)
@@ -107,16 +144,22 @@ def _handle(args: argparse.Namespace) -> None:
 
         if isinstance(raw, staticmethod):
             fn = raw.__func__
-            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            wrapped = trace(
+                limit=args.limit, storage_dir=args.storage_dir, storage=storage
+            )(fn)
             setattr(owner, name, staticmethod(wrapped))
         elif isinstance(raw, classmethod):
             fn = raw.__func__
-            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            wrapped = trace(
+                limit=args.limit, storage_dir=args.storage_dir, storage=storage
+            )(fn)
             setattr(owner, name, classmethod(wrapped))
         else:
             # Module-level function, or function stored on a class (instance method).
             fn = getattr(owner, name)
-            wrapped = trace(limit=args.limit, storage_dir=args.storage_dir, storage=storage)(fn)
+            wrapped = trace(
+                limit=args.limit, storage_dir=args.storage_dir, storage=storage
+            )(fn)
             setattr(owner, name, wrapped)
 
     logger.info(
@@ -137,7 +180,6 @@ def _handle(args: argparse.Namespace) -> None:
     except Exception as exc:
         logger.error("Error during script execution: %s", exc)
         sys.exit(1)
-
 
 
 def add_run_subparser(subparsers) -> None:
@@ -182,4 +224,3 @@ def add_run_subparser(subparsers) -> None:
         help="-- then the Python script to run (with arguments)",
     )
     p_run.set_defaults(handler=_handle)
-

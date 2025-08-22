@@ -5,6 +5,7 @@ import textwrap
 from pytead.cmd_run import _handle as run_handle
 from pytead.storage import iter_entries
 
+
 def test_cmd_run_resolves_and_wraps_methods(tmp_path, monkeypatch, caplog):
     """
     Phase 2: the 'run' command must accept module.Class.method targets and
@@ -84,4 +85,3 @@ def test_cmd_run_resolves_and_wraps_methods(tmp_path, monkeypatch, caplog):
     assert byf[k_smul]["result"] == 10
     assert byf[k_tag]["result"] == "Calc:ok"
     assert byf[k_add]["result"] == 7
-

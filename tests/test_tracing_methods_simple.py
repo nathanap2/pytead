@@ -82,4 +82,3 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert isinstance(by[k_tag]["args"][0], str) and "Calc" in by[k_tag]["args"][0]
     assert by[k_tag]["args"][1:] == ("X",)
     assert by[k_tag]["result"] == "Calc:X"
-
