@@ -104,12 +104,13 @@ class JsonStorage(_BaseStorage):
             data["kwargs"] = {}
         return data
 
-
 class ReprStorage(_BaseStorage):
     extension = ".repr"
     def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         try:
-            txt = pprint.pformat(entry, width=100, sort_dicts=False)
+            # 🔧 NEW: force a literal-friendly structure before pretty-printing
+            lit = _to_literal(entry)
+            txt = pprint.pformat(lit, width=100, sort_dicts=False)
             path.write_text(txt + "\n", encoding="utf-8")
         except Exception as exc:
             log.error("Failed to write repr %s: %s", path, exc)
