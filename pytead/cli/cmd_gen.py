@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Union
 from ..gen_tests import collect_entries, render_tests, write_tests, write_tests_per_func
 from ..logconf import configure_logger
 from ._cli_utils import unique_count
-from .config_cli import load_layered_config, apply_effective_to_args
+from .config_cli import load_layered_config, apply_effective_to_args, diagnostics_for_storage_dir
 
 
 def _emptyish(x) -> bool:
@@ -42,6 +42,12 @@ def _handle(args: argparse.Namespace) -> None:
             "or pass --storage-dir. Config used: %s",
             str(ctx.source_path) if ctx.source_path else "<none>",
         )
+        # Extra diagnostics to help understand user's environment
+        try:
+            diag = diagnostics_for_storage_dir(ctx, "gen", storage_dir)
+            logger.error("\n%s", diag)
+        except Exception:
+            pass
         sys.exit(1)
 
     storage_dir = Path(storage_dir)
@@ -50,6 +56,12 @@ def _handle(args: argparse.Namespace) -> None:
             "Storage (calls) directory '%s' does not exist or is not a directory",
             storage_dir,
         )
+        try:
+            # Show where it *should* be after anchoring under project_root
+            diag = diagnostics_for_storage_dir(ctx, "gen", storage_dir)
+            logger.error("\n%s", diag)
+        except Exception:
+            pass
         sys.exit(1)
 
     # Collect traces and render tests

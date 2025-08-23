@@ -280,3 +280,57 @@ def apply_effective_to_args(section: str, ctx: ConfigContext, args) -> None:
             _log.info("  -> filled '%s' from config: %r", k, v)
     _log.info("Args AFTER  fill: %s", {k: box[k] for k in sorted(box)})
 
+def _resolve_under_project_root(ctx: ConfigContext, p: Path | str | None) -> Path | None:
+    """Return an absolute path anchored under ctx.project_root for relative inputs."""
+    if p is None:
+        return None
+    pp = p if isinstance(p, Path) else Path(p).expanduser()
+    if not pp.is_absolute():
+        pp = ctx.project_root / pp
+    try:
+        return pp.resolve()
+    except Exception:
+        return pp
+
+def _path_status(p: Path | None) -> str:
+    if p is None:
+        return "None"
+    try:
+        exists = p.exists()
+        is_dir = p.is_dir()
+        return f"{p} (exists={exists}, is_dir={is_dir})"
+    except Exception as exc:
+        return f"{p} (stat_error={exc!r})"
+
+def diagnostics_for_storage_dir(ctx: ConfigContext, section: str, cli_value: Path | str | None) -> str:
+    """
+    Build a human-readable report explaining how storage_dir would be resolved.
+    Purely diagnostic; does not mutate anything.
+    """
+    eff_sec = effective_section(ctx, section) or {}
+    eff_def = effective_section(ctx, "defaults") or {}
+    eff_typ = effective_section(ctx, "types") or {}
+
+    c_cli  = cli_value
+    c_sec  = eff_sec.get("storage_dir")
+    c_def  = eff_def.get("storage_dir")
+    c_typ  = eff_typ.get("storage_dir")
+
+    r_cli  = _resolve_under_project_root(ctx, c_cli)
+    r_sec  = _resolve_under_project_root(ctx, c_sec)
+    r_def  = _resolve_under_project_root(ctx, c_def)
+    r_typ  = _resolve_under_project_root(ctx, c_typ)
+
+    lines = []
+    lines.append("=== pytead GEN diagnostics (storage_dir) ===")
+    lines.append(f"cwd           : {Path.cwd().resolve()}")
+    lines.append(f"project_root  : {ctx.project_root}")
+    lines.append(f"config_source : {ctx.source_path or '<none>'}")
+    lines.append("")
+    lines.append(f"CLI storage_dir      : {c_cli!r} -> {_path_status(r_cli)}")
+    lines.append(f"[{section}].storage_dir : {c_sec!r} -> {_path_status(r_sec)}")
+    lines.append(f"[defaults].storage_dir : {c_def!r} -> {_path_status(r_def)}")
+    lines.append(f"[types].storage_dir    : {c_typ!r} -> {_path_status(r_typ)}")
+    lines.append("")
+    lines.append(f"Effective [{section}] section: { {k: eff_sec[k] for k in sorted(eff_sec)} }")
+    return "\n".join(lines)

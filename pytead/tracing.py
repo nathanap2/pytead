@@ -8,7 +8,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union, cast
-
+import re
 from .storage import PickleStorage, _to_literal as _to_literal
 
 # Package-level logger stays quiet unless the host/CLI configures it.
@@ -16,6 +16,80 @@ _pkg_logger = logging.getLogger("pytead")
 if not any(isinstance(h, logging.NullHandler) for h in _pkg_logger.handlers):
     _pkg_logger.addHandler(logging.NullHandler())
 _logger = logging.getLogger("pytead.tracing")
+
+
+_OPAQUE_REPR_RE = re.compile(r"^<[\w\.]+ object at 0x[0-9A-Fa-f]+>$")
+
+def _safe_repr_or_classname(x: Any) -> str:
+    """
+    Prefer a meaningful repr; if it looks like the default '<Pkg.Class object at 0x...>',
+    fall back to the fully-qualified class name.
+    """
+    try:
+        r = repr(x)
+    except Exception:
+        r = None
+    if not r:
+        t = type(x)
+        name = getattr(t, "__qualname__", getattr(t, "__name__", str(t)))
+        return f"{t.__module__}.{name}" if t.__module__ and t.__module__ != "builtins" else name
+    if _OPAQUE_REPR_RE.match(r):
+        t = type(x)
+        name = getattr(t, "__qualname__", getattr(t, "__name__", str(t)))
+        return f"{t.__module__}.{name}" if t.__module__ and t.__module__ != "builtins" else name
+    return r
+
+def _stringify_level1(value: Any) -> Any:
+    """
+    Depth=1 stringify: turn non-builtin objects into strings (repr-or-classname).
+    For builtin containers, apply the same conversion to their direct elements,
+    without recursing deeper.
+    """
+    # Scalars / bytes-likes / None → keep literal-friendly form via _to_literal
+    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice)):
+        return _to_literal(value)
+
+    # Builtin containers: map only one level
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            kk = _to_literal(k)  # keys should stay literal
+            vv = (
+                _safe_repr_or_classname(v)
+                if not isinstance(v, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                else _to_literal(v)
+            )
+            # one-level container mapping for direct elements
+            if isinstance(v, (list, tuple, set, frozenset)):
+                vv = [
+                    _safe_repr_or_classname(e)
+                    if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                    else _to_literal(e)
+                ]
+                if isinstance(v, tuple):
+                    vv = tuple(vv)
+                if isinstance(v, (set, frozenset)):
+                    vv = sorted(vv)  # determinism
+            elif isinstance(v, dict):
+                vv = { _to_literal(kk2): (_safe_repr_or_classname(vv2)
+                      if not isinstance(vv2, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                      else _to_literal(vv2))
+                      for kk2, vv2 in v.items() }
+            out[kk] = vv
+        return out
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        seq = [
+            _safe_repr_or_classname(e)
+            if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+            else _to_literal(e)
+        ]
+        if isinstance(value, (set, frozenset)):
+            seq = sorted(seq)  # determinism
+        return tuple(seq) if isinstance(value, tuple) else list(seq)
+
+    # Any other (probably user-defined) object → string
+    return _safe_repr_or_classname(value)
 
 
 def _qualtype(obj: Any) -> str:
@@ -107,6 +181,7 @@ def trace(
     *,
     capture_objects: str = "off",
     include_private_objects: bool = False,
+    objects_stringify_depth: int = 0,  # NEW
 ):
     """
     Decorator that logs a callable's *root* calls so tests can be generated later.
@@ -176,17 +251,22 @@ Optional capture of simple objects (inputs/outputs)
         # For anything else (likely a user-defined class instance), return False.
         return False
 
-    def _obj_spec(x: Any, include_private: bool) -> Optional[dict]:
+    def _obj_spec(x: Any, include_private: bool, stringify_depth: int) -> Optional[dict]:
         """
-        Produce a serializable spec {"type": fqname, "state": snapshot} for x,
-        or None if x is builtin-like or snapshot fails.
+        Produce {"type": fqname, "state": snapshot} or None if x is builtin-like.
+        When stringify_depth==1, the state flattens nested objects to strings (repr-or-classname).
         """
         try:
-            # Avoid builtin types entirely; keep only user-defined/third-party classes.
             if getattr(type(x), "__module__", "") == "builtins":
                 return None
             t = _qualtype(x)
-            state = _snapshot_object(x, include_private=include_private)
+            if stringify_depth >= 1:
+                # Take the canonical snapshot (dict + slots, déjà filtré des callables),
+                # then stringify each value at depth=1 for stability + littéralité.
+                base = _snapshot_object(x, include_private=include_private)
+                state = {k: _stringify_level1(v) for k, v in base.items()}
+            else:
+                state = _snapshot_object(x, include_private=include_private)
             return {"type": t, "state": state}
         except Exception:
             return None
@@ -288,19 +368,19 @@ Optional capture of simple objects (inputs/outputs)
                                         if drop_first and idx == 0:
                                             continue  # self/cls handled separately
                                         if not _is_builtin_like(val):
-                                            spec = _obj_spec(val, include_private_objects)
+                                            spec = _obj_spec(val, include_private_objects, objects_stringify_depth)
                                             if spec:
                                                 obj_args_pos[idx] = spec
                                     # keywords
                                     for k, v in (kwargs or {}).items():
                                         if not _is_builtin_like(v):
-                                            spec = _obj_spec(v, include_private_objects)
+                                            spec = _obj_spec(v, include_private_objects, objects_stringify_depth)
                                             if spec:
                                                 obj_args_kw[str(k)] = spec
 
                                 result_obj = None
                                 if capture_objects != "off" and not _is_builtin_like(result):
-                                    tmp = _obj_spec(result, include_private_objects)
+                                    tmp = _obj_spec(result, include_private_objects, objects_stringify_depth)
                                     if tmp:
                                         result_obj = tmp
                                 # ----------------------------------------------------------------
