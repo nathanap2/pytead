@@ -378,3 +378,128 @@ def test_diag_trace_pipeline_depth1_comportement_actuel(tmp_path: Path):
     assert isinstance(st["tags"], list) and isinstance(st["tags"][0], str)
     assert st["tags"][0].startswith("<") and " object at 0x" in st["tags"][0]
 
+# --- bloc E : diagnostics ciblés sur depth=1 ---
+
+def _ref_collect_slots(cls):
+    """Collecte __slots__ le long de la MRO (helper local au test)."""
+    names = []
+    try:
+        for c in cls.mro():
+            s = getattr(c, "__slots__", ())
+            if not s:
+                continue
+            if isinstance(s, str):
+                names.append(s)
+            else:
+                names.extend(list(s))
+    except Exception:
+        pass
+    return names
+
+def _ref_depth1_state(x):
+    """
+    Référence "idéale" pour depth=1 : on énumère __dict__ + __slots__ et on applique
+    _stringify_level1 aux valeurs de premier niveau (sans passer par _snapshot_object).
+    """
+    from pytead.tracing import _stringify_level1
+    state = {}
+    d = getattr(x, "__dict__", None)
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if not str(k).startswith("_") and not callable(v):
+                state[str(k)] = _stringify_level1(v)
+    for name in _ref_collect_slots(type(x)):
+        if str(name).startswith("_") or name in state:
+            continue
+        try:
+            v = getattr(x, name)
+        except Exception:
+            continue
+        if not callable(v):
+            state[str(name)] = _stringify_level1(v)
+    return state
+
+
+def test_diag_depth1_obj_spec_appelle_snapshot(monkeypatch, tmp_path: Path):
+    """
+    Vérifie que, dans l'implémentation actuelle, le chemin depth=1 passe bien par
+    _snapshot_object (ce qui explique les repr opaques dans les champs imbriqués).
+    """
+    import pytead.tracing as tr
+    called = {"snapshot": 0}
+    orig = tr._snapshot_object
+
+    def spy_snapshot(obj, include_private=False):
+        called["snapshot"] += 1
+        return orig(obj, include_private=include_private)
+
+    monkeypatch.setattr(tr, "_snapshot_object", spy_snapshot)
+
+    calls = tmp_path / "calls"
+    wrapped = trace(
+        storage_dir=calls, storage=ReprStorage(),
+        capture_objects="simple", objects_stringify_depth=1
+    )(make)
+    _ = wrapped()
+
+    entries = collect_entries(calls, formats=["repr"])
+    key = next(k for k in entries if k.endswith(".make"))
+    assert "result_obj" in entries[key][0], "result_obj absent (régression inattendue)"
+    assert called["snapshot"] >= 1, "Le chemin depth=1 n'a pas invoqué _snapshot_object (comportement inattendu)"
+
+
+def test_diag_depth1_reference_state_has_classnames():
+    """
+    La "référence" depth=1 (sans snapshot préalable) produit bien des noms de classes
+    lisibles pour les objets imbriqués (ex: '...Bare'), et conserve 'Owner#42'.
+    """
+    from pytead.tracing import _safe_repr_or_classname
+    m = make()
+    ref = _ref_depth1_state(m)
+
+    assert ref["owner"] == "Owner#42"
+    assert isinstance(ref["tags"], list)
+    assert isinstance(ref["tags"][0], str) and (ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare"))
+    assert isinstance(ref["meta"], dict) and isinstance(ref["meta"]["k"], str) and (
+        ref["meta"]["k"].endswith("Bare") or ref["meta"]["k"].endswith(".Bare")
+    )
+
+
+def test_diag_compare_trace_state_vs_reference_depth1(tmp_path: Path):
+    """
+    Compare l'état capturé par la lib (pipeline actuelle) et la "référence" depth=1.
+    On vérifie qu'ils ont les mêmes clés, et on documente où ça diverge (tags[0], meta['k']).
+    """
+    calls = tmp_path / "calls"
+    wrapped = trace(
+        storage_dir=calls, storage=ReprStorage(),
+        capture_objects="simple", objects_stringify_depth=1
+    )(make)
+    inst = wrapped()
+
+    entries = collect_entries(calls, formats=["repr"])
+    key = next(k for k in entries if k.endswith(".make"))
+    st = entries[key][0]["result_obj"]["state"]
+    ref = _ref_depth1_state(inst)
+
+    # même structure globale
+    assert set(st.keys()) == set(ref.keys()) == {"name", "owner", "tags", "meta"}
+
+    # 'owner' déjà OK
+    assert st["owner"] == "Owner#42" == ref["owner"]
+
+    # Documente précisément la divergence attendue aujourd'hui
+    def _is_opaque(s: str) -> bool:
+        return isinstance(s, str) and s.startswith("<") and " object at 0x" in s and s.endswith(">")
+
+    # tags[0]
+    assert isinstance(st["tags"], list) and isinstance(ref["tags"], list)
+    assert isinstance(st["tags"][0], str) and isinstance(ref["tags"][0], str)
+    # Aujourd'hui: st -> repr opaque ; ref -> nom de classe
+    assert _is_opaque(st["tags"][0]) and (ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare"))
+
+    # meta['k']
+    kval, kval_ref = st["meta"]["k"], ref["meta"]["k"]
+    assert isinstance(kval, str) and isinstance(kval_ref, str)
+    assert _is_opaque(kval) and (kval_ref.endswith("Bare") or kval_ref.endswith(".Bare"))
+
