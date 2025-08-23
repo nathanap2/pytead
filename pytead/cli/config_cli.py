@@ -1,32 +1,36 @@
-# pytead/config.py
+# pytead/cli/config_cli.py
+from __future__ import annotations
+
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict
-import argparse
-import logging
+from typing import Any, Dict, Optional
 import os
+import logging
 import importlib.resources as ir
 
-# Exposed for debugging: where the *project-local* config was loaded from (or None)
-# This purposely *does not* point to the user-level config to avoid anchoring
-# project-specific logic on a home-wide file.
-LAST_CONFIG_PATH: Path | None = None
-
-_log = logging.getLogger("pytead.config")
+_log = logging.getLogger("pytead.cli.config")
 
 
-# ---------- File discovery helpers ----------
+@dataclass(frozen=True)
+class ConfigContext:
+    """In-memory representation of the layered configuration."""
+    raw: Dict[str, Any]               # full layered mapping with sections (defaults/run/...)
+    project_root: Path                # resolved project root (if any), else CWD
+    source_path: Optional[Path]       # project-level config file path, if found (else None)
 
 
-def _first_existing(paths: list[Path]) -> Path | None:
+# ---------- File discovery ----------
+
+def _first_existing(paths: list[Path]) -> Optional[Path]:
     for p in paths:
         if p.is_file():
             return p
     return None
 
 
-def _find_project_config(start: Path) -> Path | None:
+def _find_project_config(start: Path) -> Optional[Path]:
     """
-    Return the nearest '.pytead/config.{toml,yaml,yml}' walking upward from 'start'.
+    Return nearest '.pytead/config.{toml,yaml,yml}' walking upward from 'start'.
     """
     cur = start.resolve()
     for p in [cur, *cur.parents]:
@@ -40,9 +44,9 @@ def _find_project_config(start: Path) -> Path | None:
     return None
 
 
-def _find_user_config() -> Path | None:
+def _find_user_config() -> Optional[Path]:
     """
-    Return the user-level config in precedence order:
+    User-level precedence:
       1) $PYTEAD_CONFIG            (exact path)
       2) $XDG_CONFIG_HOME/pytead/config.{toml,yaml,yml}
       3) ~/.config/pytead/config.{toml,yaml,yml}
@@ -95,16 +99,13 @@ def _find_user_config() -> Path | None:
 
 # ---------- Parsers ----------
 
-
 def _load_toml_text(txt: str) -> Dict[str, Any]:
     try:
         import tomllib  # Python >= 3.11
-
         return tomllib.loads(txt)
     except ModuleNotFoundError:
         try:
-            import tomli  # optional backport if user has it
-
+            import tomli
             return tomli.loads(txt)
         except Exception as exc:
             _log.warning("Failed to parse TOML with tomli: %s", exc)
@@ -116,17 +117,14 @@ def _load_toml_text(txt: str) -> Dict[str, Any]:
 
 def _load_yaml_text(txt: str) -> Dict[str, Any]:
     try:
-        import yaml  # PyYAML
+        import yaml
     except Exception as exc:
-        _log.warning(
-            "Failed to import PyYAML for YAML config parsing: %s (pip install pyyaml)",
-            exc,
-        )
+        _log.warning("PyYAML not available for YAML config parsing: %s", exc)
         return {}
     try:
         data = yaml.safe_load(txt) or {}
         if not isinstance(data, dict):
-            _log.warning("YAML config root is not a mapping; ignoring.")
+            _log.warning("YAML root is not a mapping; ignoring.")
             return {}
         return data
     except Exception as exc:
@@ -147,11 +145,7 @@ def _parse_config_file(path: Path) -> Dict[str, Any]:
 
 # ---------- Merging & coercion ----------
 
-
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deep-merge two dicts: values in 'b' override 'a'; nested dicts are merged recursively.
-    """
     out = dict(a)
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -216,11 +210,6 @@ def _coerce_types(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _effective(cmd: str, raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Compute the effective section for a command by merging:
-      effective = deep_merge(raw['defaults'] or {}, raw[cmd] or {})
-    then coercing types.
-    """
     eff = _deep_merge(raw.get("defaults", {}) or {}, raw.get(cmd, {}) or {})
     eff = _coerce_types(eff)
     _log.info("Effective config for [%s]: %s", cmd, eff if eff else "{}")
@@ -228,42 +217,28 @@ def _effective(cmd: str, raw: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _is_emptyish(v: Any) -> bool:
-    """Treat None, '' and empty list/dict as 'absent' for config fill."""
-    if v is None:
-        return True
-    if isinstance(v, (list, dict, str)) and len(v) == 0:
-        return True
-    return False
+    return v is None or (isinstance(v, (str, list, dict)) and len(v) == 0)
 
 
-# ---------- Loader (layering: embedded < user < project) ----------
+# ---------- Public API (CLI-only) ----------
 
-
-def _load_default_config(start: Path | None = None) -> Dict[str, Any]:
+def load_layered_config(start: Optional[Path] = None) -> ConfigContext:
     """
     Layered load:
       base = packaged defaults (pytead/default_config.toml)
-      base ← deep-merge user-level config (if any)
-      base ← deep-merge nearest project config (if any)
-
-    Returns a single dict that still contains all sections (e.g., 'defaults', 'run', 'gen', ...).
+      base <- user-level config (if any)
+      base <- nearest project config from `start` (if any)
     """
-    global LAST_CONFIG_PATH
-
-    # 1) Packaged defaults (TOML)
+    # 1) Packaged defaults
     base: Dict[str, Any] = {}
     try:
-        txt = (
-            ir.files("pytead")
-            .joinpath("default_config.toml")
-            .read_text(encoding="utf-8")
-        )
+        txt = ir.files("pytead").joinpath("default_config.toml").read_text(encoding="utf-8")
         base = _load_toml_text(txt) or {}
     except Exception as exc:
         _log.info("No packaged defaults available: %s", exc)
         base = {}
 
-    # 2) User-level (global) config
+    # 2) User-level
     user_cfg_path = _find_user_config()
     if user_cfg_path:
         try:
@@ -271,42 +246,32 @@ def _load_default_config(start: Path | None = None) -> Dict[str, Any]:
         except Exception as exc:
             _log.warning("Failed to parse user config %s: %s", user_cfg_path, exc)
 
-    # 3) Project-local (most specific) config
+    # 3) Project-level
+    source_path = None
+    project_root = Path.cwd().resolve()
     proj_cfg_path = _find_project_config((start or Path.cwd()).resolve())
     if proj_cfg_path:
         try:
             base = _deep_merge(base, _parse_config_file(proj_cfg_path))
         except Exception as exc:
             _log.warning("Failed to parse project config %s: %s", proj_cfg_path, exc)
-        LAST_CONFIG_PATH = proj_cfg_path
-    else:
-        # Do not anchor project root to a user-level config
-        LAST_CONFIG_PATH = None
+        source_path = proj_cfg_path
+        cfg_dir = proj_cfg_path.parent
+        project_root = cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
 
-    return base
-
-
-# ---------- Public helpers used by CLI code ----------
+    return ConfigContext(raw=base, project_root=project_root, source_path=source_path)
 
 
-def apply_config_from_default_file(
-    cmd: str, args: argparse.Namespace, start: Path | None = None
-) -> None:
+def effective_section(ctx: ConfigContext, section: str) -> Dict[str, Any]:
+    return _effective(section, ctx.raw)
+
+
+def apply_effective_to_args(section: str, ctx: ConfigContext, args) -> None:
     """
-    Fill argparse fields that were NOT provided on the CLI using the layered config.
-    Additionally, if a field exists but is 'emptyish' (None, [], {}, or ""),
-    fill it from config. This fixes the case where argparse created an empty list
-    for positionals (e.g., 'targets') that should be provided by config.
-
-    The search for config starts at 'start' (e.g., the script directory) if provided.
+    Fill argparse fields that were NOT provided on the CLI using the effective section.
+    Also fill when the field exists but is "emptyish".
     """
-    raw = _load_default_config(start)
-    if not raw:
-        _log.info("No config loaded (no file found).")
-        return
-
-    eff = _effective(cmd, raw)
-
+    eff = effective_section(ctx, section)
     box = vars(args)
     _log.info("Args BEFORE fill: %s", {k: box[k] for k in sorted(box)})
     for k, v in eff.items():
@@ -315,16 +280,3 @@ def apply_config_from_default_file(
             _log.info("  -> filled '%s' from config: %r", k, v)
     _log.info("Args AFTER  fill: %s", {k: box[k] for k in sorted(box)})
 
-
-def get_effective_config(cmd: str, start: Path | None = None) -> Dict[str, Any]:
-    """
-    Return the effective config dict for a given section (e.g. "run", "tead"),
-    i.e. merge [defaults] -> [cmd] from the layered configuration (embedded < user < local),
-    then coerce types. Does not mutate argparse args.
-    The search for config starts at 'start' (e.g., the script directory) if provided.
-    """
-    raw = _load_default_config(start)
-    if not raw:
-        _log.info("get_effective_config(%s): no config file found.", cmd)
-        return {}
-    return _effective(cmd, raw)

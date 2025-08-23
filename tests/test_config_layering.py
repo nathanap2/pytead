@@ -1,8 +1,7 @@
 # tests/test_config_layering.py
 from pathlib import Path
 import argparse
-import os
-import pytead.config as cfg
+import pytead.cli.config_cli as cfg
 
 
 class _DummyFiles:
@@ -59,17 +58,22 @@ limit = 5            # overrides user-level [run].limit
 """,
     )
 
-    eff = cfg.get_effective_config("run", start=proj)
+    # Load layered config starting from project dir
+    ctx = cfg.load_layered_config(start=proj)
+    eff = cfg.effective_section(ctx, "run")
 
     # Precedence: packaged < user < local
     assert eff["limit"] == 5  # local wins
     assert eff["format"] == "json"  # user-level wins over packaged
     assert str(eff["storage_dir"]).endswith("call_logs")  # inherited from packaged
-    # LAST_CONFIG_PATH anchors to local only
-    assert cfg.LAST_CONFIG_PATH == local_cfg
+
+    # Project anchoring information lives in the context now
+    assert ctx.source_path == local_cfg
+    assert ctx.project_root == proj.resolve()
 
 
 def test_apply_config_fills_namespace_with_layered_values(tmp_path, monkeypatch):
+    # Packaged defaults (read via importlib.resources.files)
     packaged = """
 [defaults]
 storage_dir = "call_logs"
@@ -78,16 +82,14 @@ limit = 10
 [run]
 limit = 7
 """
-    # Fausse les defaults packagées
     monkeypatch.setattr(cfg.ir, "files", lambda pkg: _DummyFiles(packaged))
 
-    # Contexte user-only (pas de locale) : HOME doit pointer vers le répertoire où l'on écrit
+    # User-level: ~/.config/pytead/config.yaml
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("PYTEAD_CONFIG", raising=False)
 
-    # ~/.config/pytead/config.yaml (user-level)
     home_cfg = home / ".config" / "pytead" / "config.yaml"
     _write(
         home_cfg,
@@ -99,17 +101,20 @@ run:
 """,
     )
 
-    # Pas de config locale
+    # No local (project) config
     proj = tmp_path / "proj2"
     proj.mkdir()
 
-    # Namespace vide → rempli depuis le layering (packaged < user)
+    # Empty Namespace -> filled from layered config (packaged < user)
     ns = argparse.Namespace()
-    cfg.apply_config_from_default_file("run", ns, start=proj)
+    ctx = cfg.load_layered_config(start=proj)
+    cfg.apply_effective_to_args("run", ctx, ns)
 
-    # Vérifications
+    # Verifications
     assert ns.limit == 9
     assert ns.format == "repr"
     assert str(ns.storage_dir).endswith("call_logs")
-    # Pas de config locale détectée → pas d'ancrage projet
-    assert cfg.LAST_CONFIG_PATH is None
+
+    # No local config detected -> no project anchoring file
+    assert ctx.source_path is None
+

@@ -74,7 +74,7 @@ def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
 
 
 def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkeypatch):
-    from pytead.cmd_gen import _handle as gen_handle
+    from pytead.cli.cmd_gen import _handle as gen_handle
 
     root = tmp_path
 
@@ -91,12 +91,12 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
         """,
     )
 
-    # Config projet : calls_dir, output_dir, additional_sys_path=["src"]
+
     _w(
         root / ".pytead/config.toml",
         """
         [gen]
-        calls_dir = "calls"
+        storage_dir = "calls"
         output_dir = "tests/gen"
         additional_sys_path = ["src"]
         """,

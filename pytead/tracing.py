@@ -116,11 +116,13 @@ def trace(
     - **Instance methods**: if the first parameter is named 'self', automatically
       capture a shallow snapshot of the instance **BEFORE** and **AFTER** the call
       (attributes from __dict__ and __slots__, non-callables, private excluded).
-    - **Full state for rehydration**: we also capture `state_before/state_after`
-      including *private* attributes (converted via `_to_literal`) to be able to
-      restore an instance later if needed.
-    - **Pickle safety**: when using PickleStorage, we drop the bound first argument
-      (`self` or `cls`) from the stored `args` to avoid pickling local classes/instances.
+      We also capture a full state (including private) for potential rehydration.
+    - **Bound first argument policy**:
+        * For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
+          stored `args` to avoid pickling local classes/instances.
+        * For **JSON/REPR** storages, replace the bound first arg with a **string
+          placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
+          At replay, tests can drop this placeholder (see `pytead.rt.drop_self_placeholder`).
 
     Parameters
     ----------
@@ -212,13 +214,16 @@ def trace(
                                 initialized = True
 
                             if written < limit:
-                                # Keep bound arg only for JSON/REPR; drop for Pickle.
-                                is_pickle = isinstance(st, PickleStorage)
-                                stored_args = (
-                                    args[1:]
-                                    if (is_pickle and drop_first and len(args) >= 1)
-                                    else args
-                                )
+                                # --- Bound arg policy (self/cls) ---
+                                if drop_first and len(args) >= 1:
+                                    if isinstance(st, PickleStorage):
+                                        stored_args = args[1:]
+                                    else:
+                                        # JSON/REPR: keep a literal-friendly placeholder
+                                        stored_args = (repr(args[0]),) + args[1:]
+                                else:
+                                    stored_args = args
+                                # ----------------------------------
 
                                 entry: Dict[str, Any] = {
                                     "trace_schema": "pytead/v1",
@@ -276,3 +281,4 @@ def trace(
         return _build_wrapper(func)
 
     return decorator
+

@@ -7,7 +7,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from .typing_defs import StorageLike, TraceEntry
+
 log = logging.getLogger("pytead.storage")
+
 
 
 def _is_scalar_literal(x: Any) -> bool:
@@ -61,53 +64,40 @@ class _BaseStorage:
 
 class PickleStorage(_BaseStorage):
     extension = ".pkl"
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:
-        try:
-            with path.open("wb") as f:
-                pickle.dump(entry, f)
-        except Exception as exc:
-            log.error("Failed to write pickle %s: %s", path, exc)
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:
+    # (keep the atomic dump version only in your real file)
+    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         import os, tempfile
-
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "wb", delete=False, dir=str(path.parent)
-            ) as tmp:
+            with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(path.parent)) as tmp:
                 pickle.dump(entry, tmp)
                 tmp_name = tmp.name
-            os.replace(tmp_name, path)  # atomic on POSIX
+            os.replace(tmp_name, path)
         except Exception as exc:
             try:
-                # Cleanup temp if any
                 if "tmp_name" in locals():
                     os.unlink(tmp_name)
             except Exception:
                 pass
             log.error("Failed to write pickle %s: %s", path, exc)
 
-    def load(self, path: Path) -> Dict[str, Any]:
+    def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
         with path.open("rb") as f:
             return pickle.load(f)
 
 
 class JsonStorage(_BaseStorage):
     extension = ".json"
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:
+    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         try:
             with path.open("w", encoding="utf-8") as f:
-                json.dump(entry, f, ensure_ascii=False, default=_json_default)
+                json.dump(entry, f, ensure_ascii=False, default=lambda o: o if json.dumps(o, default=str) else repr(o))
         except Exception as exc:
             log.error("Failed to write json %s: %s", path, exc)
 
-    def load(self, path: Path) -> Dict[str, Any]:
+    def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        # Normalisation : args en tuple, kwargs dict
         if isinstance(data.get("args"), list):
             data["args"] = tuple(data["args"])
         if data.get("kwargs") is None:
@@ -117,50 +107,42 @@ class JsonStorage(_BaseStorage):
 
 class ReprStorage(_BaseStorage):
     extension = ".repr"
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:
+    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         try:
-            lit = _to_literal(entry)
-            txt = pprint.pformat(lit, width=100, sort_dicts=False)
+            txt = pprint.pformat(entry, width=100, sort_dicts=False)
             path.write_text(txt + "\n", encoding="utf-8")
         except Exception as exc:
             log.error("Failed to write repr %s: %s", path, exc)
 
-    def load(self, path: Path) -> Dict[str, Any]:
+    def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
         txt = path.read_text(encoding="utf-8")
         data = ast.literal_eval(txt)
         return data
 
 
-_REGISTRY: Dict[str, Any] = {
+_REGISTRY: Dict[str, StorageLike] = {
     "pickle": PickleStorage(),
     "json": JsonStorage(),
     "repr": ReprStorage(),
 }
 
 
-def get_storage(name: Optional[str]) -> Any:
+def get_storage(name: Optional[str]) -> StorageLike:
     if not name:
         return _REGISTRY["pickle"]
     try:
         return _REGISTRY[name]
     except KeyError:
-        raise ValueError(
-            "Unknown storage format '{}'. Available: {}".format(
-                name, list(_REGISTRY.keys())
-            )
-        )
+        raise ValueError("Unknown storage format '{}'. Available: {}".format(name, list(_REGISTRY.keys())))
 
 
-def storages_from_names(names: Optional[List[str]]) -> List[Any]:
+def storages_from_names(names: Optional[List[str]]) -> List[StorageLike]:
     if not names:
         return list(_REGISTRY.values())
     return [get_storage(n) for n in names]
 
 
-def iter_entries(
-    calls_dir: Path, formats: Optional[List[str]] = None
-) -> Iterable[Dict[str, Any]]:
+def iter_entries(calls_dir: Path, formats: Optional[List[str]] = None) -> Iterable[TraceEntry]:
     for st in storages_from_names(formats):
         for p in sorted(calls_dir.glob(f"*{st.extension}")):
             try:
@@ -177,6 +159,6 @@ def iter_entries(
                     args = tuple(args)
                 except Exception:
                     pass
-            entry["args"] = args
-            entry["kwargs"] = entry.get("kwargs", {}) or {}
-            yield entry
+            entry["args"] = args  # type: ignore[index]
+            entry["kwargs"] = entry.get("kwargs", {}) or {}  # type: ignore[index]
+            yield entry  # type: ignore[misc]

@@ -10,5 +10,5 @@ limit = 7
 output_dir = "tests/generated"
 
 [types]
-calls_dir = "call_logs"
+storage_dir = "call_logs"
 out_dir = "typings"

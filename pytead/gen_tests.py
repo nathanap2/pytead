@@ -10,16 +10,16 @@ from ._cases import unique_cases, case_id, render_case_tuple, pformat
 
 
 def collect_entries(
-    calls_dir: Union[str, Path], formats: Optional[List[str]] = None
+    storage_dir: Union[str, Path], formats: Optional[List[str]] = None
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Collect all log entries from traces in calls_dir (supports multiple formats).
+    Collect all log entries from traces in storage_dir (supports multiple formats).
     :param formats: optional list like ["pickle", "json"]; default: scan all.
     """
-    path = Path(calls_dir)
+    path = Path(storage_dir)
     if not path.exists() or not path.is_dir():
         raise ValueError(
-            f"Calls directory '{calls_dir}' does not exist or is not a directory"
+            f"Calls directory '{storage_dir}' does not exist or is not a directory"
         )
 
     log = logging.getLogger("pytead.gen")
@@ -109,85 +109,33 @@ def render_tests(
     Render pytest-compatible test code.
 
     Design:
-      - Optional header to inject sys.path entries at runtime (relative to detected project root).
-      - Dynamic resolution of the callable from its fully-qualified name (supports module.Class.method).
-      - Instance methods are replayed by rehydrating 'self' (object.__new__ + state_before).
+      - Lightweight header that imports runtime helpers from pytead.rt:
+            ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder
+      - Optional sys.path setup via ensure_import_roots(__file__, [...])
+      - Instance methods are replayed by rehydrating 'self' from snapshots.
 
     Parametrization schema per case:
       ('args', 'kwargs', 'expected', 'self_type', 'self_state')
 
     Notes:
-      - For instance methods, if traces stored a 'self' placeholder string as args[0] (JSON/REPR),
-        the test drops it before calling the bound method on the rehydrated instance.
+      - For instance methods, if traces stored a 'self' placeholder string as args[0]
+        (JSON/REPR formats), the test drops it before calling the bound method.
       - For pickle traces, args never contain the bound arg; nothing is dropped.
     """
     lines: List[str] = []
 
-    # Optional: runtime sys.path setup for non-root modules
-    if import_roots:
-        lines += [
-            "import sys, os",
-            "from pathlib import Path",
-            "",
-            "_HERE = Path(__file__).resolve()",
-            "def _find_root(start: Path) -> Path:",
-            "    for p in [start] + list(start.parents):",
-            "        if (p / '.pytead').exists() or (p / 'pyproject.toml').exists():",
-            "            return p",
-            "    return start.parent",
-            "",
-            "_ROOT = _find_root(_HERE)",
-            "__PYTEAD_IMPORTS = [",
-        ]
-        for p in import_roots:
-            lines.append(f"    {str(p)!r},")
-        lines += [
-            "]",
-            "for _raw in __PYTEAD_IMPORTS:",
-            "    _p = _raw if os.path.isabs(_raw) else str((_ROOT / _raw).resolve())",
-            "    if _p not in sys.path:",
-            "        sys.path.insert(0, _p)",
-            "",
-        ]
-
-    # Dynamic resolver and rehydrator
+    # --- compact, readable header using pytead.rt helpers ---
+    lines.append(
+        "from pytead.rt import ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder"
+    )
+    roots = import_roots if import_roots is not None else ["."]
+    joined = ", ".join(repr(str(p)) for p in roots)
+    lines.append(f"ensure_import_roots(__file__, [{joined}])")
     lines += [
-        "import importlib",
-        "",
-        "def _resolve_attr(fq: str):",
-        "    parts = fq.split('.')",
-        "    # Import the longest importable module prefix",
-        "    for i in range(len(parts), 0, -1):",
-        "        mod_name = '.'.join(parts[:i])",
-        "        try:",
-        "            obj = importlib.import_module(mod_name)",
-        "            rest = parts[i:]",
-        "            break",
-        "        except Exception:",
-        "            continue",
-        "    else:",
-        "        raise ImportError(f'Cannot import any prefix of {fq!r}')",
-        "    for name in rest:",
-        "        obj = getattr(obj, name)",
-        "    return obj",
-        "",
-        "def _rehydrate(type_fq: str, state: dict | None):",
-        "    mod_name, cls_name = type_fq.rsplit('.', 1)",
-        "    cls = getattr(importlib.import_module(mod_name), cls_name)",
-        "    inst = object.__new__(cls)  # bypass __init__",
-        "    for k, v in (state or {}).items():",
-        "        try:",
-        "            object.__setattr__(inst, k, v)",
-        "        except Exception:",
-        "            try:",
-        "                setattr(inst, k, v)",
-        "            except Exception:",
-        "                pass",
-        "    return inst",
-        "",
         "import pytest",
         "",
     ]
+    # --------------------------------------------------------
 
     for func_fullname, entries in sorted(entries_by_func.items(), key=lambda kv: kv[0]):
         # Split for a readable test name; resolution stays dynamic on the full FQN.
@@ -215,19 +163,13 @@ def render_tests(
         # Branch: instance method vs others
         lines.append(f"    fq = {func_fullname!r}")
         lines.append("    if self_type:")
-        lines.append("        # Instance method: rehydrate and bind")
-        lines.append("        inst = _rehydrate(self_type, self_state)")
+        lines.append("        inst = rehydrate(self_type, self_state)")
         lines.append("        method_name = fq.rsplit('.', 1)[1]")
         lines.append("        bound = getattr(inst, method_name)")
-        lines.append("        # Some storage formats include a 'self' repr as args[0] — drop it if detected")
-        lines.append("        if args and isinstance(args[0], str):")
-        lines.append("            cls_name = self_type.rsplit('.', 1)[1]")
-        lines.append("            if args[0].startswith('<') and cls_name in args[0]:")
-        lines.append("                args = args[1:]")
+        lines.append("        args = drop_self_placeholder(args, self_type)")
         lines.append("        assert bound(*args, **kwargs) == expected")
         lines.append("    else:")
-        lines.append("        # Function / staticmethod / classmethod")
-        lines.append("        fn = _resolve_attr(fq)")
+        lines.append("        fn = resolve_attr(fq)")
         lines.append("        assert fn(*args, **kwargs) == expected")
         lines.append("")
 

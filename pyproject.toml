@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pytead = "pytead.cli:main"
+pytead = "pytead.cli.main:main"
 
 [project.urls]
 Homepage      = "https://github.com/nathanap2/pytead"

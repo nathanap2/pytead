@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from pathlib import Path
 import textwrap
 
-from pytead.cmd_run import _handle as run_handle
+from pytead.cli.cmd_run import _handle as run_handle
 from pytead.storage import iter_entries
 
 

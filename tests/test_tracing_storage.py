@@ -24,10 +24,13 @@ def test_root_call_only_with_recursion(tmp_path: Path):
     entries = list(iter_entries(tmp_path, formats=["pickle"]))
     assert len(entries) == 1
     e = entries[0]
+    # Champs essentiels présents
+    assert "trace_schema" in e and e["trace_schema"].startswith("pytead/")
     assert e["func"].endswith(".fact")
     assert e["args"] == (5,)
     assert e["kwargs"] == {}
     assert e["result"] == 120
+    assert "timestamp" in e and isinstance(e["timestamp"], str)
 
 
 def test_limit_is_respected(tmp_path: Path):
@@ -45,6 +48,10 @@ def test_limit_is_respected(tmp_path: Path):
 
     entries = list(iter_entries(tmp_path, formats=["pickle"]))
     assert len(entries) == 2
+    # Normalisations
+    for e in entries:
+        assert isinstance(e["args"], tuple)
+        assert isinstance(e["kwargs"], dict)
 
 
 def test_json_storage_and_normalization(tmp_path: Path):
@@ -67,9 +74,10 @@ def test_json_storage_and_normalization(tmp_path: Path):
         assert isinstance(e["args"], tuple)
         assert e["kwargs"] == {}
         assert "sum" in e["result"]
+        assert isinstance(e["result"]["lst"], list)
 
 
-def test_repr_storage_preserves_tuples(tmp_path):
+def test_repr_storage_preserves_tuples(tmp_path: Path):
     from pytead.storage import ReprStorage, iter_entries
 
     st = ReprStorage()
@@ -87,21 +95,24 @@ def test_repr_storage_preserves_tuples(tmp_path):
 
     # lecture via iter_entries (normalisations incluses)
     entries = list(iter_entries(tmp_path, formats=["repr"]))
-    assert entries[0]["args"] == (1, (2, 3))
-    assert entries[0]["kwargs"]["k"] == (4, 5)
-    assert isinstance(entries[0]["result"][0]["a"], tuple)
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["args"] == (1, (2, 3))
+    assert e["kwargs"]["k"] == (4, 5)
+    # tuple préservé dans le résultat
+    assert isinstance(e["result"][0]["a"], tuple)
 
 
 def test_all_storages_have_make_path():
     from pytead.storage import _REGISTRY
-    from pathlib import Path
 
     for name, st in _REGISTRY.items():
         p = st.make_path(Path("."), "m.mod.f")  # ne doit pas lever
         assert p.suffix == st.extension
+        assert isinstance(p, Path)
 
 
-def test_repr_storage_preserves_int_keys(tmp_path):
+def test_repr_storage_preserves_int_keys(tmp_path: Path):
     from pytead.storage import ReprStorage, iter_entries
 
     st = ReprStorage()
@@ -117,7 +128,9 @@ def test_repr_storage_preserves_int_keys(tmp_path):
     st.dump(entry, p)
 
     e = list(iter_entries(tmp_path, formats=["repr"]))[0]
+    # Clés int et tuple préservées
     assert 1 in e["kwargs"] and e["kwargs"][1] == "a"
     assert (2, 3) in e["kwargs"] and e["kwargs"][(2, 3)] == "b"
     assert 10 in e["result"] and e["result"][10] == "x"
     assert (4, 5) in e["result"] and e["result"][(4, 5)] == "y"
+

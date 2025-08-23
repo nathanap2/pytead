@@ -1,4 +1,4 @@
-from pytead._cli_utils import split_targets_and_cmd
+from pytead.cli._cli_utils import split_targets_and_cmd
 
 
 def test_split_with_double_dash():

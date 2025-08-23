@@ -105,7 +105,7 @@ pytead gen [options]
 
 **Common options**
 
-* `-c, --calls-dir PATH` — directory containing trace files
+* `-c, --storage-dir PATH` — directory containing trace files
 * `-o, --output PATH` — write a single test module
 * `-d, --output-dir PATH` — write one test module **per function** into this directory
 * `--formats {pickle,json,repr}...` — restrict which formats to read
@@ -127,25 +127,9 @@ pytead tead [options] <module.function> [...] -- <script.py> [script args...]
 
 **Extras**
 
-* `--pre-clean` — delete existing traces for targeted functions before tracing
-* `--pre-clean-before YYYY-MM-DD|ISO8601` — only delete older traces
 * `--gen-formats {pickle,json,repr}...` — restrict formats when reading for generation
 * `--only-targets` — generate tests **only** for the functions targeted in this command
 * `-o/--output` or `-d/--output-dir` — same as `gen` (defaults to a single file if neither is provided)
-
----
-
-### `pytead clean`
-
-Delete trace files by function, pattern, format, and/or date. Examples:
-
-```bash
-
-# Narrow deletion to selected functions (exact names) and formats
-pytead clean --func mymodule.multiply --formats pickle json
-```
-
-Run `pytead clean -h` for the full set of options.
 
 ---
 
@@ -220,12 +204,9 @@ targets = ["mymodule.multiply"]
 [gen]
 output_dir = "tests/generated"
 
-[clean]
-calls_dir = "call_logs"
-
 [tead]
 targets = ["mymodule.multiply"]
-calls_dir = "call_logs"
+storage_dir = "call_logs"
 only_targets = true
 ```
 

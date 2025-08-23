@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Tuple
 
-from ._cases import unique_cases
+from .._cases import unique_cases
 
 
 __all__ = [

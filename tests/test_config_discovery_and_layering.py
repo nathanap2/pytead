@@ -7,14 +7,14 @@ import runpy
 import sys
 import textwrap
 
-import pytead.config as cfg
+import pytead.cli.config_cli as cfg
 
 
 # -------- Helpers --------
 
 
 class _DummyFiles:
-    """Shim minimal pour monkey-patcher importlib.resources.files('pytead')."""
+    """Minimal shim to monkey-patch importlib.resources.files('pytead')."""
 
     def __init__(self, text: str):
         self._text = text
@@ -38,7 +38,7 @@ def _touch(p: Path) -> Path:
     return p
 
 
-# -------- Tests de découverte user/local (nouvelles fonctions) --------
+# -------- User/local discovery (new CLI config module) --------
 
 
 def test_find_user_config_precedence(tmp_path, monkeypatch):
@@ -86,16 +86,16 @@ def test_find_project_config_walks_up(tmp_path):
     assert found == nearest
 
 
-# -------- Tests de layering embarqué < user < local --------
+# -------- Layering tests: packaged < user < local --------
 
 
 def test_layering_embedded_user_local_precedence(tmp_path, monkeypatch):
     """
-    Vérifie l'empilement et la priorité:
+    Check precedence:
       packaged defaults < user-level < project-local
-    et LAST_CONFIG_PATH qui n'ancre que la locale.
+    and that ctx.source_path anchors only to the local project config.
     """
-    # Packaged defaults (via monkeypatch de cfg.ir.files)
+    # Packaged defaults (via monkeypatch of cfg.ir.files)
     packaged = """
 [defaults]
 limit = 10
@@ -131,18 +131,20 @@ limit = 7
         """,
     )
 
-    eff = cfg.get_effective_config("run", start=proj)
+    ctx = cfg.load_layered_config(start=proj)
+    eff = cfg.effective_section(ctx, "run")
 
     assert eff["limit"] == 5  # local wins
     assert eff["format"] == "json"  # user wins over packaged
     assert str(eff["storage_dir"]).endswith("call_logs")  # inherited from packaged
-    assert cfg.LAST_CONFIG_PATH == local_cfg  # anchor on local only
+    assert ctx.source_path == local_cfg  # anchor on local only
+    assert ctx.project_root == proj.resolve()
 
 
 def test_layering_user_only_when_no_local(tmp_path, monkeypatch):
     """
-    Sans config locale, on doit hériter des defaults packagés,
-    surchargés par la config user, et LAST_CONFIG_PATH reste None.
+    Without local config, inherit packaged defaults overridden by user config.
+    ctx.source_path remains None.
     """
     packaged = """
 [defaults]
@@ -157,8 +159,11 @@ limit = 7
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("PYTEAD_CONFIG", raising=False)
+
     # YAML user config (HOME/.config)
-    user_yaml = _write(
+    _write(
         home / ".config" / "pytead" / "config.yaml",
         """
         defaults:
@@ -168,21 +173,21 @@ limit = 7
         """,
     )
 
-    eff = cfg.get_effective_config("run", start=tmp_path / "work")
+    ctx = cfg.load_layered_config(start=tmp_path / "work")
+    eff = cfg.effective_section(ctx, "run")
 
     assert eff["limit"] == 9
     assert eff["format"] == "repr"
     assert str(eff["storage_dir"]).endswith("call_logs")
-    assert cfg.LAST_CONFIG_PATH is None
+    assert ctx.source_path is None
 
 
-# -------- Tests apply_config + découverte depuis le dossier du script --------
+# -------- apply_effective_to_args + discovery from script dir --------
 
 
 def test_apply_config_fills_namespace(tmp_path, monkeypatch):
     """
-    apply_config_from_default_file doit remplir un Namespace vide
-    avec les valeurs issues du layering.
+    apply_effective_to_args must fill an empty Namespace with layered values.
     """
     packaged = """
 [defaults]
@@ -206,7 +211,8 @@ limit = 7
     )
 
     ns = argparse.Namespace()  # simulate no CLI flags
-    cfg.apply_config_from_default_file("run", ns, start=proj)
+    ctx = cfg.load_layered_config(start=proj)
+    cfg.apply_effective_to_args("run", ctx, ns)
 
     assert ns.limit == 5
     assert ns.format == "pickle"
@@ -216,10 +222,15 @@ limit = 7
 
 def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog):
     """
-    `pytead run` doit chercher la config à partir du dossier du script (start_hint),
-    même si le CWD est ailleurs. On évite l’exécution réelle avec des monkeypatch.
+    `pytead run` must look for config starting from the script's directory (start_hint),
+    even if CWD is elsewhere. Avoid real execution via monkeypatch.
     """
-    from pytead import cmd_run
+    # Import the updated command module
+    from pytead.cli import cmd_run
+
+    # (optional but stabilizes the assertion surface)
+    import logging
+    caplog.set_level(logging.INFO, logger="pytead")
 
     # Packaged defaults (minimal)
     monkeypatch.setattr(
@@ -237,7 +248,7 @@ def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog)
         ),
     )
 
-    # Petit repo
+    # Small repo
     repo = tmp_path / "repo"
     repo.mkdir()
     config_path = _write(
@@ -263,58 +274,55 @@ def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog)
         """,
     )
 
-    # CWD à l’extérieur
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    # Import du module du repo
-    sys.path.insert(0, str(repo))
+    # Ensure repo is NOT already on sys.path (we want to observe insertion)
+    while str(repo) in sys.path:
+        sys.path.remove(str(repo))
 
-    # Neutraliser l’exécution réelle du script et l’écriture de traces
+    # Neutralize actual script execution
     monkeypatch.setattr(runpy, "run_path", lambda *a, **k: None, raising=True)
 
-    def _noop_trace(**_kwargs):
-        def _dec(fn):
-            return fn
+    # Neutralize real instrumentation (return the targets as "seen")
+    import pytead.targets as tg
+    monkeypatch.setattr(
+        tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
+    )
 
-        return _dec
-
-    monkeypatch.setattr(cmd_run, "trace", _noop_trace, raising=True)
-
-    class NS:  # Namespace simulé par argparse
+    class NS:
         pass
 
     args = NS()
-    args.targets = []  # vide → fallback config [run].targets
-    args.cmd = [str(script_path)]  # comme argparse.REMAINDER
+    args.targets = []  # empty -> fallback to [run].targets in project config
+    args.cmd = [str(script_path)]  # like argparse.REMAINDER
 
+    outside = tmp_path / "outside"
+    outside.mkdir()
     old_cwd = Path.cwd()
     try:
         os.chdir(outside)
         cmd_run._handle(args)
 
-        # Vérifie qu’on a bien pris la config du repo
-        from pytead import config as _cfgmod
-
-        assert _cfgmod.LAST_CONFIG_PATH == config_path
-
-        # Vérifie qu’on a instrumenté la cible
+        # We should have instrumented the config-provided target
         log_text = "\n".join(rec.message for rec in caplog.records)
         assert "Instrumentation applied" in log_text
         assert "mymodule.multiply" in log_text
+
+        # And repo should have been added to sys.path by import env setup
+        assert str(repo) in sys.path
     finally:
         os.chdir(old_cwd)
-        if str(repo) in sys.path:
+        # Clean sys.path pollution if any
+        while str(repo) in sys.path:
             sys.path.remove(str(repo))
 
 
-# -------- Tests PYTEAD_CONFIG (YAML) --------
+# -------- PYTEAD_CONFIG (YAML) --------
 
 
 def test_env_yaml_via_pytead_config(tmp_path, monkeypatch):
     """
-    PYTEAD_CONFIG peut pointer vers un YAML et doit être honoré.
+    PYTEAD_CONFIG may point to a YAML and must be honored.
     """
-    # Packaged pour hériter des champs non définis
+    # Packaged (to inherit missing fields)
     monkeypatch.setattr(
         cfg.ir,
         "files",
@@ -340,12 +348,12 @@ def test_env_yaml_via_pytead_config(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("PYTEAD_CONFIG", str(user_cfg))
 
-    from pytead.config import apply_config_from_default_file
-
     ns = argparse.Namespace()
-    apply_config_from_default_file("run", ns, start=None)
+    ctx = cfg.load_layered_config(start=None)
+    cfg.apply_effective_to_args("run", ctx, ns)
 
     assert ns.limit == 9
     assert ns.format == "repr"
     assert str(ns.storage_dir).endswith("call_logs")
     assert ns.targets == ["pkg.mod.fn"]
+

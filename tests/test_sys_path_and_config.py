@@ -186,10 +186,13 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
     # Évite l’exécution réelle du script
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
 
-    # No-op trace pour éviter d’écrire des fichiers
-    import pytead.cmd_run as cmd_run
+    # No-op instrumentation : patcher l'endroit correct
+    import pytead.targets as tg
+    monkeypatch.setattr(
+        tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
+    )
 
-    monkeypatch.setattr(cmd_run, "trace", lambda **kw: (lambda f: f), raising=True)
+    import pytead.cli.cmd_run as cmd_run
 
     # Prépare args type argparse
     class NS:
@@ -205,7 +208,7 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
         os.chdir(outside)
         cmd_run._handle(args)
 
-        # 1) Vérifications d’import réelles (le plus significatif)
+        # 1) Vérifications d’import réelles
         mod_iou = importlib.import_module("ioutils")
         assert callable(getattr(mod_iou, "render_json", None))
         assert mod_iou.render_json(3) == {"x": 3}
@@ -217,14 +220,12 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
         mod_adj = importlib.import_module("adjacent_mod")
         assert mod_adj.echo("ok") == "ok"
 
-        # 2) Vérifie que les chemins attendus sont présents
+        # 2) Chemins attendus
         assert str((repo / "app").resolve()) in sys.path  # script dir
-        assert str(repo.resolve()) in sys.path  # base path
-        assert (
-            str((repo / "logical_entities").resolve()) in sys.path
-        )  # additional_sys_path
+        assert str(repo.resolve()) in sys.path            # base path
+        assert str((repo / "logical_entities").resolve()) in sys.path  # additional_sys_path
 
-        # 3) Logs d’instrumentation (maintenant qu’on capte INFO)
+        # 3) Logs d’instrumentation
         log_text = "\n".join(r.message for r in caplog.records)
         assert "Instrumentation applied to 3 target(s)" in log_text
         assert "ioutils.render_json" in log_text
@@ -267,11 +268,14 @@ def test_cmd_run_resolves_relative_additional_sys_path(tmp_path, monkeypatch, ca
 
     write(app / "main.py", "pass")
 
-    # No-op exécution & trace
+    # No-op exécution & instrumentation
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
-    import pytead.cmd_run as cmd_run
+    import pytead.targets as tg
+    monkeypatch.setattr(
+        tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
+    )
 
-    monkeypatch.setattr(cmd_run, "trace", lambda **kw: (lambda f: f), raising=True)
+    import pytead.cli.cmd_run as cmd_run
 
     class NS:
         pass
@@ -306,11 +310,14 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
     caplog.set_level(logging.INFO, logger="pytead")
     repo, script = make_repo_with_yaml(tmp_path)
 
-    # No-op exécution & trace
+    # No-op exécution & instrumentation
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
-    import pytead.tead_all_in_one as tead
+    import pytead.targets as tg
+    monkeypatch.setattr(
+        tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
+    )
 
-    monkeypatch.setattr(tead, "trace", lambda **kw: (lambda f: f), raising=True)
+    import pytead.cli.cmd_tead as tead
 
     class NS:
         pass
@@ -334,13 +341,12 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
 
         # Chemins présents
         assert str((repo / "app").resolve()) in sys.path  # script dir
-        assert str(repo.resolve()) in sys.path  # base path
-        assert (
-            str((repo / "logical_entities").resolve()) in sys.path
-        )  # additional_sys_path
+        assert str(repo.resolve()) in sys.path            # base path
+        assert str((repo / "logical_entities").resolve()) in sys.path  # additional_sys_path
 
         # Logs (au moins une des cibles doit apparaître)
         log_text = "\n".join(r.message for r in caplog.records)
         assert ("ioutils.render_json" in log_text) or ("adjacent_mod.echo" in log_text)
     finally:
         os.chdir(old_cwd)
+
