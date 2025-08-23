@@ -65,16 +65,21 @@ def _stringify_level1(value: Any) -> Any:
                     _safe_repr_or_classname(e)
                     if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
                     else _to_literal(e)
+                    for e in v
                 ]
                 if isinstance(v, tuple):
                     vv = tuple(vv)
                 if isinstance(v, (set, frozenset)):
                     vv = sorted(vv)  # determinism
             elif isinstance(v, dict):
-                vv = { _to_literal(kk2): (_safe_repr_or_classname(vv2)
-                      if not isinstance(vv2, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
-                      else _to_literal(vv2))
-                      for kk2, vv2 in v.items() }
+                vv = {
+                    _to_literal(kk2): (
+                        _safe_repr_or_classname(vv2)
+                        if not isinstance(vv2, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                        else _to_literal(vv2)
+                    )
+                    for kk2, vv2 in v.items()
+                }
             out[kk] = vv
         return out
 
@@ -83,6 +88,7 @@ def _stringify_level1(value: Any) -> Any:
             _safe_repr_or_classname(e)
             if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
             else _to_literal(e)
+            for e in value
         ]
         if isinstance(value, (set, frozenset)):
             seq = sorted(seq)  # determinism
@@ -90,6 +96,7 @@ def _stringify_level1(value: Any) -> Any:
 
     # Any other (probably user-defined) object → string
     return _safe_repr_or_classname(value)
+
 
 
 def _qualtype(obj: Any) -> str:
@@ -250,27 +257,74 @@ Optional capture of simple objects (inputs/outputs)
             return True
         # For anything else (likely a user-defined class instance), return False.
         return False
-
     def _obj_spec(x: Any, include_private: bool, stringify_depth: int) -> Optional[dict]:
         """
-        Produce {"type": fqname, "state": snapshot} or None if x is builtin-like.
-        When stringify_depth==1, the state flattens nested objects to strings (repr-or-classname).
+        Objets non-builtin → dict {"type": fqname, "state": {...}}.
+        - depth == 0 : snapshot canonique (_snapshot_object), sûr et littéral.
+        - depth >= 1 : **pas** de snapshot canonique (qui stringifie trop tôt) ; on énumère
+        __dict__ + __slots__ et on applique _stringify_level1 aux valeurs **au premier niveau**.
+        => Les objets sans __repr__ utile deviennent un nom de classe (via _safe_repr_or_classname),
+            y compris s'ils sont dans des conteneurs (list/tuple/set/dict) au premier niveau.
         """
-        try:
-            if getattr(type(x), "__module__", "") == "builtins":
-                return None
-            t = _qualtype(x)
-            if stringify_depth >= 1:
-                # Take the canonical snapshot (dict + slots, déjà filtré des callables),
-                # then stringify each value at depth=1 for stability + littéralité.
-                base = _snapshot_object(x, include_private=include_private)
-                state = {k: _stringify_level1(v) for k, v in base.items()}
-            else:
-                state = _snapshot_object(x, include_private=include_private)
-            return {"type": t, "state": state}
-        except Exception:
+        # On ne capture pas les builtins
+        if getattr(type(x), "__module__", "") == "builtins":
             return None
 
+        t = _qualtype(x)
+
+        # Chemin depth==0 : inchangé
+        if stringify_depth <= 0:
+            try:
+                state0 = _snapshot_object(x, include_private=include_private)
+            except Exception:
+                state0 = {}
+            return {"type": t, "state": state0}
+
+        # Chemin depth>=1 : énumération explicite + stringify(1)
+        state: dict[str, Any] = {}
+        try:
+            processed: set[str] = set()
+
+            # __dict__
+            d = getattr(x, "__dict__", None)
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if not include_private and str(k).startswith("_"):
+                        continue
+                    try:
+                        if callable(v):
+                            continue
+                        state[str(k)] = _stringify_level1(v)
+                        processed.add(str(k))
+                    except Exception:
+                        # jamais bloquant
+                        pass
+
+            # __slots__
+            for name in _iter_slots(type(x)):
+                if not include_private and str(name).startswith("_"):
+                    continue
+                if str(name) in processed:
+                    continue
+                try:
+                    v = getattr(x, name)
+                except Exception:
+                    continue
+                try:
+                    if callable(v):
+                        continue
+                    state[str(name)] = _stringify_level1(v)
+                except Exception:
+                    pass
+
+        except Exception:
+            # fallback sûr
+            state = {}
+
+        return {"type": t, "state": state}
+
+    
+    
     # ----------------------------------------------------------------------
 
     def _build_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:

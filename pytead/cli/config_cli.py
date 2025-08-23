@@ -100,20 +100,28 @@ def _find_user_config() -> Optional[Path]:
 # ---------- Parsers ----------
 
 def _load_toml_text(txt: str) -> Dict[str, Any]:
+    # Try stdlib tomllib (3.11+), then tomli (3.9/3.10), then 'toml' en dernier recours.
     try:
-        import tomllib  # Python >= 3.11
-        return tomllib.loads(txt)
-    except ModuleNotFoundError:
+        import tomllib  # 3.11+
         try:
-            import tomli
-            return tomli.loads(txt)
+            return tomllib.loads(txt)
         except Exception as exc:
-            _log.warning("Failed to parse TOML with tomli: %s", exc)
-            return {}
-    except Exception as exc:
-        _log.warning("Failed to parse TOML with tomllib: %s", exc)
-        return {}
+            _log.warning("tomllib failed to parse TOML: %s", exc)
+    except ModuleNotFoundError:
+        pass
 
+    try:
+        import tomli  # 3.9/3.10
+        return tomli.loads(txt)
+    except Exception as exc:
+        _log.warning("tomli not available or failed: %s", exc)
+
+    try:
+        import toml  # optional fallback if present
+        return toml.loads(txt)
+    except Exception as exc:
+        _log.warning("No TOML parser succeeded (tomllib/tomli/toml): %s", exc)
+        return {}
 
 def _load_yaml_text(txt: str) -> Dict[str, Any]:
     try:
