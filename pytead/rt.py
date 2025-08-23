@@ -92,3 +92,50 @@ def drop_self_placeholder(args: tuple, self_type: Optional[str]) -> tuple:
         return args[1:]
     return args
 
+
+
+def inject_object_args(args: tuple, kwargs: dict, obj_args: dict | None, self_type: str | None) -> tuple[tuple, dict]:
+    """
+    Replace positional/keyword arguments with rehydrated instances from obj_args:
+      obj_args = {"pos": {idx: {"type": "...", "state": {...}}, ...},
+                  "kw":  {name: {"type": "...", "state": {...}}, ...}}
+    If a self placeholder is present at args[0] (JSON/REPR), indices in "pos" are
+    shifted accordingly (the placeholder will be dropped before call).
+    """
+    if not obj_args:
+        return args, kwargs
+
+    pos = dict(obj_args.get("pos") or {})
+    kw  = dict(obj_args.get("kw") or {})
+
+    # Detect whether args[0] is a self placeholder like "<Cls object at 0x...>"
+    shift = 0
+    if self_type and args and isinstance(args[0], str):
+        cls_name = self_type.rsplit(".", 1)[-1]
+        if args[0].startswith("<") and cls_name in args[0]:
+            shift = 1
+
+    lst = list(args)
+    for idx, spec in pos.items():
+        try:
+            i = int(idx)
+        except Exception:
+            continue
+        tgt = i - shift if shift and i > 0 else i
+        if 0 <= tgt < len(lst):
+            lst[tgt] = rehydrate(spec["type"], spec.get("state"))
+    for k, spec in kw.items():
+        if k in kwargs:
+            kwargs[k] = rehydrate(spec["type"], spec.get("state"))
+    return tuple(lst), kwargs
+
+
+def assert_object_state(obj: Any, expected_state: Dict[str, Any]) -> None:
+    """
+    Assert that each attribute in expected_state exists on obj and equals the expected value.
+    Produces readable assertion messages; ignores extra attributes on obj.
+    """
+    for k, v in (expected_state or {}).items():
+        actual = getattr(obj, k)
+        assert actual == v, f"attribute {k!r}: got {actual!r}, expected {v!r}"
+

@@ -104,6 +104,9 @@ def trace(
     limit: int = 10,
     storage_dir: Union[str, Path] = Path("call_logs"),
     storage=None,
+    *,
+    capture_objects: str = "off",
+    include_private_objects: bool = False,
 ):
     """
     Decorator that logs a callable's *root* calls so tests can be generated later.
@@ -113,28 +116,82 @@ def trace(
     - Per-thread depth tracking ensures only the outermost call is recorded.
     - Pluggable Storage backend (pickle by default).
     - Uses a lightweight, versioned schema header ("pytead/v1").
-    - **Instance methods**: if the first parameter is named 'self', automatically
-      capture a shallow snapshot of the instance **BEFORE** and **AFTER** the call
-      (attributes from __dict__ and __slots__, non-callables, private excluded).
-      We also capture a full state (including private) for potential rehydration.
-    - **Bound first argument policy**:
-        * For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
-          stored `args` to avoid pickling local classes/instances.
-        * For **JSON/REPR** storages, replace the bound first arg with a **string
-          placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
-          At replay, tests can drop this placeholder (see `pytead.rt.drop_self_placeholder`).
 
-    Parameters
-    ----------
-    limit : int
-        Max number of trace files written per decorated callable.
-    storage_dir : str | Path
-        Directory where trace files are written.
-    storage : StorageLike | None
-        Storage backend (defaults to PickleStorage()).
+    Instance methods
+    ----------------
+    - If the first parameter is named 'self', we:
+        * snapshot instance state (public + full/private variants) before/after,
+        * store it under entry["self"] = {
+              "type": str, "before": dict, "after": dict,
+              "state_before": dict, "state_after": dict
+          }
+        * apply a "bound first arg policy":
+            - For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
+              stored `args` to avoid pickling local classes/instances.
+            - For **JSON/REPR** storages, replace the bound first arg with a **string
+              placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
+              At replay, tests can drop this placeholder (see pytead.rt.drop_self_placeholder).
+
+Optional capture of simple objects (inputs/outputs)
+---------------------------------------------------
+    Controlled via:
+        capture_objects: "off" | "simple"
+            - "off"   : current behavior (no extra capture for inputs/outputs)
+            - "simple": shallow snapshot of non-builtin objects in args/kwargs/result
+        include_private_objects: bool
+            - include private attributes (starting with '_') when snapshotting inputs/outputs
+
+    When enabled, we add:
+        entry["obj_args"] = {
+            "pos": { index: {"type": "pkg.Cls", "state": {...}}, ... },
+            "kw":  { name:  {"type": "pkg.Cls", "state": {...}}, ... }
+        }
+        entry["result_obj"] = {"type": "pkg.Cls", "state": {...}}  # if result is a non-builtin object
+
+    Notes:
+    - Position indices for "pos" are those of the *call site*, before any drop of `self`.
+      The test helper (rt.inject_object_args) will compensate if a self placeholder was present.
     """
     storage_path = Path(storage_dir)
     st = storage or PickleStorage()
+
+    # ---- Local helpers (kept inside to avoid exposing internal policy) ----
+
+    def _is_builtin_like(x: Any) -> bool:
+        """
+        Return True if x is 'safe-literal' or a builtin container likely represented
+        faithfully by repr/json; custom instances return False and are candidates
+        for object snapshotting.
+        """
+        from collections.abc import Mapping, Sequence, Set
+
+        if x is None or isinstance(x, (str, bytes, bytearray, memoryview, bool, int, float, complex)):
+            return True
+        if isinstance(x, (range, slice)):
+            return True
+        # Builtin containers (their *elements* may still be objects, but we snapshot the
+        # top-level object only in this mode to keep policy simple).
+        if isinstance(x, (list, tuple, set, frozenset, dict)):
+            return True
+        # For anything else (likely a user-defined class instance), return False.
+        return False
+
+    def _obj_spec(x: Any, include_private: bool) -> Optional[dict]:
+        """
+        Produce a serializable spec {"type": fqname, "state": snapshot} for x,
+        or None if x is builtin-like or snapshot fails.
+        """
+        try:
+            # Avoid builtin types entirely; keep only user-defined/third-party classes.
+            if getattr(type(x), "__module__", "") == "builtins":
+                return None
+            t = _qualtype(x)
+            state = _snapshot_object(x, include_private=include_private)
+            return {"type": t, "state": state}
+        except Exception:
+            return None
+
+    # ----------------------------------------------------------------------
 
     def _build_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
         qual = getattr(fn, "__qualname__", getattr(fn, "__name__", "<lambda>"))
@@ -193,14 +250,11 @@ def trace(
 
                 if is_root:
                     try:
+                        # AFTER snapshots for self (if relevant)
                         if pub_before is not None and len(args) >= 1:
                             try:
-                                pub_after = _snapshot_object(
-                                    args[0], include_private=False
-                                )
-                                all_after = _snapshot_object(
-                                    args[0], include_private=True
-                                )
+                                pub_after = _snapshot_object(args[0], include_private=False)
+                                all_after = _snapshot_object(args[0], include_private=True)
                             except Exception:
                                 pub_after = all_after = None
 
@@ -225,6 +279,32 @@ def trace(
                                     stored_args = args
                                 # ----------------------------------
 
+                                # ---- Optional capture of simple objects in inputs/outputs ----
+                                obj_args_pos: Dict[int, dict] = {}
+                                obj_args_kw: Dict[str, dict] = {}
+                                if capture_objects != "off":
+                                    # positionals (use call-site indices; rt.inject_object_args will adjust for self)
+                                    for idx, val in enumerate(args):
+                                        if drop_first and idx == 0:
+                                            continue  # self/cls handled separately
+                                        if not _is_builtin_like(val):
+                                            spec = _obj_spec(val, include_private_objects)
+                                            if spec:
+                                                obj_args_pos[idx] = spec
+                                    # keywords
+                                    for k, v in (kwargs or {}).items():
+                                        if not _is_builtin_like(v):
+                                            spec = _obj_spec(v, include_private_objects)
+                                            if spec:
+                                                obj_args_kw[str(k)] = spec
+
+                                result_obj = None
+                                if capture_objects != "off" and not _is_builtin_like(result):
+                                    tmp = _obj_spec(result, include_private_objects)
+                                    if tmp:
+                                        result_obj = tmp
+                                # ----------------------------------------------------------------
+
                                 entry: Dict[str, Any] = {
                                     "trace_schema": "pytead/v1",
                                     "func": fullname,
@@ -246,6 +326,11 @@ def trace(
                                         "state_before": all_before,
                                         "state_after": all_after,
                                     }
+                                if capture_objects != "off":
+                                    if obj_args_pos or obj_args_kw:
+                                        entry["obj_args"] = {"pos": obj_args_pos, "kw": obj_args_kw}
+                                    if result_obj is not None:
+                                        entry["result_obj"] = result_obj
 
                                 path = st.make_path(storage_path, fullname)
                                 st.dump(entry, path)

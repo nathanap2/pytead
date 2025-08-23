@@ -1,4 +1,6 @@
 # pytead/gen_tests.py
+from __future__ import annotations
+
 from collections import defaultdict
 from pathlib import Path
 import logging
@@ -6,7 +8,7 @@ from typing import Any, Dict, List, Tuple, Union, Optional
 import textwrap
 
 from .storage import iter_entries
-from ._cases import unique_cases, case_id, render_case_tuple, pformat
+from ._cases import unique_cases, case_id, pformat  # keep existing helpers for IDs/formatting
 
 
 def collect_entries(
@@ -36,55 +38,84 @@ def collect_entries(
     return dict(entries_by_func)
 
 
-# ------------------------
-# Helpers for parametrization with 'self'
-# ------------------------
+# ---------------------------------------------------------------------------
+# Extended normalization/deduplication including self snapshot + object args/result
+# We move from 5-tuple (args, kwargs, expected, self_type, self_state)
+# to 7-tuple (args, kwargs, expected, self_type, self_state, obj_args, result_spec).
+# ---------------------------------------------------------------------------
 
-def _normalize_with_self(e: Dict[str, Any]) -> Tuple[tuple, dict, Any, Optional[str], Optional[dict]]:
-    """Return (args, kwargs, expected, self_type, self_state_before)."""
+def _normalize_with_objs(
+    e: Dict[str, Any]
+) -> Tuple[tuple, dict, Any, Optional[str], Optional[dict], Optional[dict], Optional[dict]]:
+    """
+    Extract a stable, hashable-friendly view of one trace entry:
+      - args: tuple
+      - kwargs: dict
+      - expected: any
+      - self_type: str | None
+      - self_state: dict | None  (we keep 'state_before' for rehydration)
+      - obj_args: dict | None    (see tracing.py schema: {"pos":{idx:spec}, "kw":{name:spec}})
+      - result_spec: dict | None (spec for returned object, if any)
+    """
     args = tuple(e.get("args", ()))
     kwargs = dict(e.get("kwargs", {}) or {})
     expected = e.get("result")
 
-    s = e.get("self")
-    if isinstance(s, dict):
-        self_type = s.get("type")
-        self_state = s.get("state_before")
-    else:
-        self_type = None
-        self_state = None
+    s = e.get("self") or {}
+    self_type = s.get("type")
+    self_state = s.get("state_before")
 
-    return args, kwargs, expected, self_type, self_state
+    obj_args = e.get("obj_args") if isinstance(e.get("obj_args"), dict) else None
+    result_spec = e.get("result_obj") if isinstance(e.get("result_obj"), dict) else None
+
+    return args, kwargs, expected, self_type, self_state, obj_args, result_spec
 
 
-def _case_key_with_self(
-    args: tuple, kwargs: dict, expected: Any, self_type: Optional[str], self_state: Optional[dict]
+def _case_key_with_objs(
+    args: tuple,
+    kwargs: dict,
+    expected: Any,
+    self_type: Optional[str],
+    self_state: Optional[dict],
+    obj_args: Optional[dict],
+    result_spec: Optional[dict],
 ) -> str:
-    """Stable key including self snapshot to avoid dropping necessary state."""
+    """Stable key for deduplication; repr-based is sufficient for our literal-friendly payload."""
     try:
         kw_items = tuple(sorted(kwargs.items()))
     except Exception:
         kw_items = tuple(kwargs.items())
-    return repr((args, kw_items, expected, self_type, self_state))
+    return repr((args, kw_items, expected, self_type, self_state, obj_args, result_spec))
 
 
-def _unique_cases_with_self(entries: List[Dict[str, Any]]) -> List[Tuple[tuple, dict, Any, Optional[str], Optional[dict]]]:
-    """Deduplicate taking into account the self snapshot (if any)."""
+def _unique_cases_with_objs(
+    entries: List[Dict[str, Any]]
+) -> List[Tuple[tuple, dict, Any, Optional[str], Optional[dict], Optional[dict], Optional[dict]]]:
+    """Deduplicate while taking into account self snapshot + object inputs/outputs."""
     seen, out = set(), []
     for e in entries:
-        args, kwargs, expected, self_type, self_state = _normalize_with_self(e)
-        k = _case_key_with_self(args, kwargs, expected, self_type, self_state)
+        tup = _normalize_with_objs(e)
+        k = _case_key_with_objs(*tup)
         if k in seen:
             continue
         seen.add(k)
-        out.append((args, kwargs, expected, self_type, self_state))
+        out.append(tup)
     return out
 
 
-def _render_case_quintuple(
-    args: tuple, kwargs: dict, expected: Any, self_type: Optional[str], self_state: Optional[dict], base_indent: int = 8
+def _render_case_septuple(
+    args: tuple,
+    kwargs: dict,
+    expected: Any,
+    self_type: Optional[str],
+    self_state: Optional[dict],
+    obj_args: Optional[dict],
+    result_spec: Optional[dict],
+    base_indent: int = 8,
 ) -> List[str]:
-    """Pretty-print a 5-tuple case for the parametrize block."""
+    """
+    Pretty-print a single 7-tuple case for the parametrize block (with indentation).
+    """
     indent_item = " " * base_indent
     indent_body = " " * (base_indent + 4)
     body = (
@@ -92,14 +123,16 @@ def _render_case_quintuple(
         f"{pformat(kwargs)},\n"
         f"{pformat(expected)},\n"
         f"{pformat(self_type)},\n"
-        f"{pformat(self_state)},"
+        f"{pformat(self_state)},\n"
+        f"{pformat(obj_args)},\n"
+        f"{pformat(result_spec)},"
     )
     return [f"{indent_item}(", textwrap.indent(body, indent_body), f"{indent_item}),"]
 
 
-# ------------------------
+# ---------------------------------------------------------------------------
 # Test rendering
-# ------------------------
+# ---------------------------------------------------------------------------
 
 def render_tests(
     entries_by_func: Dict[str, List[Dict[str, Any]]],
@@ -109,13 +142,16 @@ def render_tests(
     Render pytest-compatible test code.
 
     Design:
-      - Lightweight header that imports runtime helpers from pytead.rt:
-            ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder
+      - Lightweight header importing runtime helpers from pytead.rt:
+            ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder,
+            inject_object_args, assert_object_state
       - Optional sys.path setup via ensure_import_roots(__file__, [...])
       - Instance methods are replayed by rehydrating 'self' from snapshots.
+      - Simple objects in inputs are reconstructed via inject_object_args(...).
+      - Simple object outputs are validated structurally (attributes), not by identity.
 
-    Parametrization schema per case:
-      ('args', 'kwargs', 'expected', 'self_type', 'self_state')
+    Parametrization schema per case (7 tuple):
+      ('args', 'kwargs', 'expected', 'self_type', 'self_state', 'obj_args', 'result_spec')
 
     Notes:
       - For instance methods, if traces stored a 'self' placeholder string as args[0]
@@ -126,7 +162,7 @@ def render_tests(
 
     # --- compact, readable header using pytead.rt helpers ---
     lines.append(
-        "from pytead.rt import ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder"
+        "from pytead.rt import ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder, inject_object_args, assert_object_state"
     )
     roots = import_roots if import_roots is not None else ["."]
     joined = ", ".join(repr(str(p)) for p in roots)
@@ -143,34 +179,44 @@ def render_tests(
         module_path, func_name = ".".join(parts[:-1]), parts[-1]
         module_sanitized = module_path.replace(".", "_") if module_path else "root"
 
-        cases = _unique_cases_with_self(entries)
+        cases = _unique_cases_with_objs(entries)
 
-        # Parametrized block with self info
+        # Parametrized block with self + obj_args + result_spec
         lines.append("@pytest.mark.parametrize(")
-        lines.append("    'args, kwargs, expected, self_type, self_state',")
+        lines.append("    'args, kwargs, expected, self_type, self_state, obj_args, result_spec',")
         lines.append("    [")
-        for a, k, r, stype, sstate in cases:
-            lines.extend(_render_case_quintuple(a, k, r, stype, sstate, base_indent=8))
+        for a, k, r, stype, sstate, oas, rspec in cases:
+            lines.extend(
+                _render_case_septuple(a, k, r, stype, sstate, oas, rspec, base_indent=8)
+            )
         lines.append("    ],")
         lines.append("    ids=[")
-        for a, k, _r, _t, _s in cases:
+        for a, k, _r, _t, _s, _oa, _rs in cases:
             lines.append(f"        {case_id(a, k)!r},")
         lines.append("    ]")
         lines.append(")")
         lines.append(
-            f"def test_{module_sanitized}_{func_name}(args, kwargs, expected, self_type, self_state):"
+            f"def test_{module_sanitized}_{func_name}(args, kwargs, expected, self_type, self_state, obj_args, result_spec):"
         )
-        # Branch: instance method vs others
         lines.append(f"    fq = {func_fullname!r}")
         lines.append("    if self_type:")
         lines.append("        inst = rehydrate(self_type, self_state)")
         lines.append("        method_name = fq.rsplit('.', 1)[1]")
         lines.append("        bound = getattr(inst, method_name)")
         lines.append("        args = drop_self_placeholder(args, self_type)")
-        lines.append("        assert bound(*args, **kwargs) == expected")
+        lines.append("        args, kwargs = inject_object_args(args, kwargs, obj_args, self_type)")
+        lines.append("        out = bound(*args, **kwargs)")
         lines.append("    else:")
         lines.append("        fn = resolve_attr(fq)")
-        lines.append("        assert fn(*args, **kwargs) == expected")
+        lines.append("        args, kwargs = inject_object_args(args, kwargs, obj_args, None)")
+        lines.append("        out = fn(*args, **kwargs)")
+        lines.append("    if result_spec:")
+        lines.append("        # Validate the structure of the returned object (not identity).")
+        lines.append("        typ = resolve_attr(result_spec['type'])")
+        lines.append("        assert isinstance(out, typ), f\"expected instance of {result_spec['type']}\"")
+        lines.append("        assert_object_state(out, result_spec.get('state') or {})")
+        lines.append("    else:")
+        lines.append("        assert out == expected")
         lines.append("")
 
     return "\n".join(lines)

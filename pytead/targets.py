@@ -1,16 +1,16 @@
 from __future__ import annotations
+
 import inspect
+import importlib
+import logging
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Set, Tuple
 
 from .tracing import trace
 from .errors import TargetResolutionError
 
-import importlib
-
-
-import logging
 log = logging.getLogger("pytead.targets")
+
 
 @dataclass(frozen=True)
 class ResolvedTarget:
@@ -19,10 +19,15 @@ class ResolvedTarget:
     kind: str    # "func" | "instancemethod" | "classmethod" | "staticmethod"
 
 
-
-
-
 def _import_longest_prefix(fq: str):
+    """
+    Import the longest module prefix of a fully-qualified name.
+
+    Returns
+    -------
+    (module, tail: list[str])
+        `tail` are the remaining attribute names to getattr() through.
+    """
     parts = fq.split(".")
     for i in range(len(parts), 0, -1):
         mod_name = ".".join(parts[:i])
@@ -35,6 +40,10 @@ def _import_longest_prefix(fq: str):
 
 
 def resolve_target(fq: str) -> ResolvedTarget:
+    """
+    Resolve a fully-qualified target (function or method) and classify its kind.
+    Uses inspect.getattr_static to avoid triggering descriptors during detection.
+    """
     mod, tail = _import_longest_prefix(fq)
     if not tail:
         raise AttributeError(f"No attribute after module in '{fq}'")
@@ -51,12 +60,19 @@ def resolve_target(fq: str) -> ResolvedTarget:
     elif inspect.isfunction(raw):
         kind = "instancemethod" if inspect.isclass(owner) else "func"
     else:
-        kind = "func"  # conservative fallback
+        # Conservative fallback: treat as plain function/callable attr
+        kind = "func"
     return ResolvedTarget(owner=owner, attr=attr, kind=kind)
 
 
 def instrument_targets(
-    targets: Iterable[str], *, limit: int, storage_dir, storage
+    targets: Iterable[str],
+    *,
+    limit: int,
+    storage_dir,
+    storage,
+    capture_objects: str = "simple",
+    include_private_objects: bool = False,
 ) -> Set[str]:
     """
     Resolve & instrument each target with the @trace decorator.
@@ -67,16 +83,26 @@ def instrument_targets(
     - Inserts detailed INFO logs to help diagnose which object/file was wrapped.
     - After installation, asserts (best-effort) that the installed object exposes
       a wrapped function (__wrapped__ present on the function or on __func__).
+    - NEW: propagates object-capture options to trace(...):
+        capture_objects: "off" | "simple"
+        include_private_objects: whether to include private attrs in snapshots.
 
     Returns:
-        Set of fully-qualified names that were instrumented.
+        Set[str]: fully-qualified names that were instrumented.
 
     Raises:
-        TargetResolutionError: if one or more targets could not be resolved,
-        or if wrapping failed on some of them.
+        TargetResolutionError: consolidated resolution/wrapping errors.
     """
     resolved: List[Tuple[ResolvedTarget, str]] = []
     errors: list[str] = []
+
+    log.info(
+        "Instrumentation: limit=%s storage_dir=%s capture_objects=%s include_private_objects=%s",
+        limit,
+        storage_dir,
+        capture_objects,
+        include_private_objects,
+    )
 
     # 1) Resolve all targets first so we can surface a consolidated error
     for t in targets:
@@ -85,8 +111,13 @@ def instrument_targets(
             resolved.append((rt, t))
             owner_file = getattr(rt.owner, "__file__", None)
             owner_name = getattr(rt.owner, "__name__", type(rt.owner).__name__)
-            log.info("Resolved %s -> owner=%s file=%s kind=%s",
-                     t, owner_name, owner_file, rt.kind)
+            log.info(
+                "Resolved %s -> owner=%s file=%s kind=%s",
+                t,
+                owner_name,
+                owner_file,
+                rt.kind,
+            )
         except Exception as exc:
             errors.append(f"Cannot resolve target '{t}': {exc}")
 
@@ -107,16 +138,36 @@ def instrument_targets(
 
             if isinstance(raw_static, staticmethod):
                 inner = raw_static.__func__
-                wrapped = trace(limit=limit, storage_dir=storage_dir, storage=storage)(inner)
+                wrapped = trace(
+                    limit=limit,
+                    storage_dir=storage_dir,
+                    storage=storage,
+                    capture_objects=capture_objects,
+                    include_private_objects=include_private_objects,
+                )(inner)
                 setattr(rt.owner, name, staticmethod(wrapped))
+
             elif isinstance(raw_static, classmethod):
                 inner = raw_static.__func__
-                wrapped = trace(limit=limit, storage_dir=storage_dir, storage=storage)(inner)
+                wrapped = trace(
+                    limit=limit,
+                    storage_dir=storage_dir,
+                    storage=storage,
+                    capture_objects=capture_objects,
+                    include_private_objects=include_private_objects,
+                )(inner)
                 setattr(rt.owner, name, classmethod(wrapped))
+
             else:
-                # plain function or any callable attribute
+                # Plain function or any callable attribute
                 fn = getattr(rt.owner, name)
-                wrapped = trace(limit=limit, storage_dir=storage_dir, storage=storage)(fn)
+                wrapped = trace(
+                    limit=limit,
+                    storage_dir=storage_dir,
+                    storage=storage,
+                    capture_objects=capture_objects,
+                    include_private_objects=include_private_objects,
+                )(fn)
                 setattr(rt.owner, name, wrapped)
 
             # Post-condition: did we really install a wrapped function?
@@ -134,6 +185,7 @@ def instrument_targets(
             log.info("Wrapped %s on %s (has_wrapped=%s)", name, owner_name, has_wrapped)
 
             seen.add(fq)
+
         except Exception as exc:
             errors.append(f"Failed to instrument '{fq}': {exc}")
 
@@ -142,5 +194,4 @@ def instrument_targets(
         raise TargetResolutionError("\n".join(errors))
 
     return seen
-
 
