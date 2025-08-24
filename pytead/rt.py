@@ -5,20 +5,15 @@ from typing import Any, Dict, Iterable, Optional
 import importlib
 import os
 import sys
+from .imports import detect_project_root
+
 
 def _find_root(start: Path) -> Path:
-    """
-    Walk upward from 'start' to find a plausible project root:
-    a directory that contains '.pytead' or 'pyproject.toml'.
-    Fallback: parent of start.
-    """
-    cur = start.resolve()
-    for p in [cur] + list(cur.parents):
-        if (p / ".pytead").exists() or (p / "pyproject.toml").exists():
-            return p
-    return start.parent
+    return detect_project_root(start, fallback="parent")
 
-def ensure_import_roots(here_file: str | os.PathLike[str], import_roots: Iterable[str | os.PathLike[str]]) -> None:
+def ensure_import_roots(
+    here_file: str | os.PathLike[str], import_roots: Iterable[str | os.PathLike[str]]
+) -> None:
     """
     Insert runtime import paths (script dir, project root, plus user-provided
     relative or absolute paths) at the front of sys.path, without duplicates.
@@ -41,6 +36,7 @@ def ensure_import_roots(here_file: str | os.PathLike[str], import_roots: Iterabl
     for ap in to_add[::-1]:
         sys.path.insert(0, ap)
 
+
 def resolve_attr(fq: str) -> Any:
     """
     Resolve a fully-qualified attribute: 'pkg.mod.Class.method' or 'pkg.mod.func'.
@@ -61,6 +57,7 @@ def resolve_attr(fq: str) -> Any:
         obj = getattr(obj, name)
     return obj
 
+
 def rehydrate(type_fq: str, state: Optional[Dict[str, Any]]) -> Any:
     """
     Create an instance of 'type_fq' without calling __init__, then set attributes
@@ -79,6 +76,7 @@ def rehydrate(type_fq: str, state: Optional[Dict[str, Any]]) -> Any:
                 pass
     return inst
 
+
 def drop_self_placeholder(args: tuple, self_type: Optional[str]) -> tuple:
     """
     Some non-pickle formats keep a human repr of 'self' as args[0]:
@@ -93,8 +91,9 @@ def drop_self_placeholder(args: tuple, self_type: Optional[str]) -> tuple:
     return args
 
 
-
-def inject_object_args(args: tuple, kwargs: dict, obj_args: dict | None, self_type: str | None) -> tuple[tuple, dict]:
+def inject_object_args(
+    args: tuple, kwargs: dict, obj_args: dict | None, self_type: str | None
+) -> tuple[tuple, dict]:
     """
     Replace positional/keyword arguments with rehydrated instances from obj_args:
       obj_args = {"pos": {idx: {"type": "...", "state": {...}}, ...},
@@ -106,7 +105,7 @@ def inject_object_args(args: tuple, kwargs: dict, obj_args: dict | None, self_ty
         return args, kwargs
 
     pos = dict(obj_args.get("pos") or {})
-    kw  = dict(obj_args.get("kw") or {})
+    kw = dict(obj_args.get("kw") or {})
 
     # Detect whether args[0] is a self placeholder like "<Cls object at 0x...>"
     shift = 0
@@ -138,4 +137,3 @@ def assert_object_state(obj: Any, expected_state: Dict[str, Any]) -> None:
     for k, v in (expected_state or {}).items():
         actual = getattr(obj, k)
         assert actual == v, f"attribute {k!r}: got {actual!r}, expected {v!r}"
-

@@ -20,6 +20,7 @@ _logger = logging.getLogger("pytead.tracing")
 
 _OPAQUE_REPR_RE = re.compile(r"^<[\w\.]+ object at 0x[0-9A-Fa-f]+>$")
 
+
 def _safe_repr_or_classname(x: Any) -> str:
     """
     Prefer a meaningful repr; if it looks like the default '<Pkg.Class object at 0x...>',
@@ -32,12 +33,21 @@ def _safe_repr_or_classname(x: Any) -> str:
     if not r:
         t = type(x)
         name = getattr(t, "__qualname__", getattr(t, "__name__", str(t)))
-        return f"{t.__module__}.{name}" if t.__module__ and t.__module__ != "builtins" else name
+        return (
+            f"{t.__module__}.{name}"
+            if t.__module__ and t.__module__ != "builtins"
+            else name
+        )
     if _OPAQUE_REPR_RE.match(r):
         t = type(x)
         name = getattr(t, "__qualname__", getattr(t, "__name__", str(t)))
-        return f"{t.__module__}.{name}" if t.__module__ and t.__module__ != "builtins" else name
+        return (
+            f"{t.__module__}.{name}"
+            if t.__module__ and t.__module__ != "builtins"
+            else name
+        )
     return r
+
 
 def _stringify_level1(value: Any) -> Any:
     """
@@ -46,7 +56,10 @@ def _stringify_level1(value: Any) -> Any:
     without recursing deeper.
     """
     # Scalars / bytes-likes / None → keep literal-friendly form via _to_literal
-    if value is None or isinstance(value, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice)):
+    if value is None or isinstance(
+        value,
+        (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice),
+    ):
         return _to_literal(value)
 
     # Builtin containers: map only one level
@@ -56,14 +69,52 @@ def _stringify_level1(value: Any) -> Any:
             kk = _to_literal(k)  # keys should stay literal
             vv = (
                 _safe_repr_or_classname(v)
-                if not isinstance(v, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                if not isinstance(
+                    v,
+                    (
+                        bool,
+                        int,
+                        float,
+                        complex,
+                        str,
+                        bytes,
+                        bytearray,
+                        memoryview,
+                        range,
+                        slice,
+                        list,
+                        tuple,
+                        set,
+                        frozenset,
+                        dict,
+                    ),
+                )
                 else _to_literal(v)
             )
             # one-level container mapping for direct elements
             if isinstance(v, (list, tuple, set, frozenset)):
                 vv = [
                     _safe_repr_or_classname(e)
-                    if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                    if not isinstance(
+                        e,
+                        (
+                            bool,
+                            int,
+                            float,
+                            complex,
+                            str,
+                            bytes,
+                            bytearray,
+                            memoryview,
+                            range,
+                            slice,
+                            list,
+                            tuple,
+                            set,
+                            frozenset,
+                            dict,
+                        ),
+                    )
                     else _to_literal(e)
                     for e in v
                 ]
@@ -75,7 +126,26 @@ def _stringify_level1(value: Any) -> Any:
                 vv = {
                     _to_literal(kk2): (
                         _safe_repr_or_classname(vv2)
-                        if not isinstance(vv2, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+                        if not isinstance(
+                            vv2,
+                            (
+                                bool,
+                                int,
+                                float,
+                                complex,
+                                str,
+                                bytes,
+                                bytearray,
+                                memoryview,
+                                range,
+                                slice,
+                                list,
+                                tuple,
+                                set,
+                                frozenset,
+                                dict,
+                            ),
+                        )
                         else _to_literal(vv2)
                     )
                     for kk2, vv2 in v.items()
@@ -86,7 +156,26 @@ def _stringify_level1(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         seq = [
             _safe_repr_or_classname(e)
-            if not isinstance(e, (bool, int, float, complex, str, bytes, bytearray, memoryview, range, slice, list, tuple, set, frozenset, dict))
+            if not isinstance(
+                e,
+                (
+                    bool,
+                    int,
+                    float,
+                    complex,
+                    str,
+                    bytes,
+                    bytearray,
+                    memoryview,
+                    range,
+                    slice,
+                    list,
+                    tuple,
+                    set,
+                    frozenset,
+                    dict,
+                ),
+            )
             else _to_literal(e)
             for e in value
         ]
@@ -96,7 +185,6 @@ def _stringify_level1(value: Any) -> Any:
 
     # Any other (probably user-defined) object → string
     return _safe_repr_or_classname(value)
-
 
 
 def _qualtype(obj: Any) -> str:
@@ -191,48 +279,48 @@ def trace(
     objects_stringify_depth: int = 0,  # NEW
 ):
     """
-    Decorator that logs a callable's *root* calls so tests can be generated later.
+        Decorator that logs a callable's *root* calls so tests can be generated later.
 
-    Behavior
-    --------
-    - Per-thread depth tracking ensures only the outermost call is recorded.
-    - Pluggable Storage backend (pickle by default).
-    - Uses a lightweight, versioned schema header ("pytead/v1").
+        Behavior
+        --------
+        - Per-thread depth tracking ensures only the outermost call is recorded.
+        - Pluggable Storage backend (pickle by default).
+        - Uses a lightweight, versioned schema header ("pytead/v1").
 
-    Instance methods
-    ----------------
-    - If the first parameter is named 'self', we:
-        * snapshot instance state (public + full/private variants) before/after,
-        * store it under entry["self"] = {
-              "type": str, "before": dict, "after": dict,
-              "state_before": dict, "state_after": dict
-          }
-        * apply a "bound first arg policy":
-            - For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
-              stored `args` to avoid pickling local classes/instances.
-            - For **JSON/REPR** storages, replace the bound first arg with a **string
-              placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
-              At replay, tests can drop this placeholder (see pytead.rt.drop_self_placeholder).
+        Instance methods
+        ----------------
+        - If the first parameter is named 'self', we:
+            * snapshot instance state (public + full/private variants) before/after,
+            * store it under entry["self"] = {
+                  "type": str, "before": dict, "after": dict,
+                  "state_before": dict, "state_after": dict
+              }
+            * apply a "bound first arg policy":
+                - For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
+                  stored `args` to avoid pickling local classes/instances.
+                - For **JSON/REPR** storages, replace the bound first arg with a **string
+                  placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
+                  At replay, tests can drop this placeholder (see pytead.rt.drop_self_placeholder).
 
-Optional capture of simple objects (inputs/outputs)
----------------------------------------------------
-    Controlled via:
-        capture_objects: "off" | "simple"
-            - "off"   : current behavior (no extra capture for inputs/outputs)
-            - "simple": shallow snapshot of non-builtin objects in args/kwargs/result
-        include_private_objects: bool
-            - include private attributes (starting with '_') when snapshotting inputs/outputs
+    Optional capture of simple objects (inputs/outputs)
+    ---------------------------------------------------
+        Controlled via:
+            capture_objects: "off" | "simple"
+                - "off"   : current behavior (no extra capture for inputs/outputs)
+                - "simple": shallow snapshot of non-builtin objects in args/kwargs/result
+            include_private_objects: bool
+                - include private attributes (starting with '_') when snapshotting inputs/outputs
 
-    When enabled, we add:
-        entry["obj_args"] = {
-            "pos": { index: {"type": "pkg.Cls", "state": {...}}, ... },
-            "kw":  { name:  {"type": "pkg.Cls", "state": {...}}, ... }
-        }
-        entry["result_obj"] = {"type": "pkg.Cls", "state": {...}}  # if result is a non-builtin object
+        When enabled, we add:
+            entry["obj_args"] = {
+                "pos": { index: {"type": "pkg.Cls", "state": {...}}, ... },
+                "kw":  { name:  {"type": "pkg.Cls", "state": {...}}, ... }
+            }
+            entry["result_obj"] = {"type": "pkg.Cls", "state": {...}}  # if result is a non-builtin object
 
-    Notes:
-    - Position indices for "pos" are those of the *call site*, before any drop of `self`.
-      The test helper (rt.inject_object_args) will compensate if a self placeholder was present.
+        Notes:
+        - Position indices for "pos" are those of the *call site*, before any drop of `self`.
+          The test helper (rt.inject_object_args) will compensate if a self placeholder was present.
     """
     storage_path = Path(storage_dir)
     st = storage or PickleStorage()
@@ -247,7 +335,9 @@ Optional capture of simple objects (inputs/outputs)
         """
         from collections.abc import Mapping, Sequence, Set
 
-        if x is None or isinstance(x, (str, bytes, bytearray, memoryview, bool, int, float, complex)):
+        if x is None or isinstance(
+            x, (str, bytes, bytearray, memoryview, bool, int, float, complex)
+        ):
             return True
         if isinstance(x, (range, slice)):
             return True
@@ -257,7 +347,10 @@ Optional capture of simple objects (inputs/outputs)
             return True
         # For anything else (likely a user-defined class instance), return False.
         return False
-    def _obj_spec(x: Any, include_private: bool, stringify_depth: int) -> Optional[dict]:
+
+    def _obj_spec(
+        x: Any, include_private: bool, stringify_depth: int
+    ) -> Optional[dict]:
         """
         Objets non-builtin → dict {"type": fqname, "state": {...}}.
         - depth == 0 : snapshot canonique (_snapshot_object), sûr et littéral.
@@ -323,8 +416,6 @@ Optional capture of simple objects (inputs/outputs)
 
         return {"type": t, "state": state}
 
-    
-    
     # ----------------------------------------------------------------------
 
     def _build_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -387,8 +478,12 @@ Optional capture of simple objects (inputs/outputs)
                         # AFTER snapshots for self (if relevant)
                         if pub_before is not None and len(args) >= 1:
                             try:
-                                pub_after = _snapshot_object(args[0], include_private=False)
-                                all_after = _snapshot_object(args[0], include_private=True)
+                                pub_after = _snapshot_object(
+                                    args[0], include_private=False
+                                )
+                                all_after = _snapshot_object(
+                                    args[0], include_private=True
+                                )
                             except Exception:
                                 pub_after = all_after = None
 
@@ -422,19 +517,33 @@ Optional capture of simple objects (inputs/outputs)
                                         if drop_first and idx == 0:
                                             continue  # self/cls handled separately
                                         if not _is_builtin_like(val):
-                                            spec = _obj_spec(val, include_private_objects, objects_stringify_depth)
+                                            spec = _obj_spec(
+                                                val,
+                                                include_private_objects,
+                                                objects_stringify_depth,
+                                            )
                                             if spec:
                                                 obj_args_pos[idx] = spec
                                     # keywords
                                     for k, v in (kwargs or {}).items():
                                         if not _is_builtin_like(v):
-                                            spec = _obj_spec(v, include_private_objects, objects_stringify_depth)
+                                            spec = _obj_spec(
+                                                v,
+                                                include_private_objects,
+                                                objects_stringify_depth,
+                                            )
                                             if spec:
                                                 obj_args_kw[str(k)] = spec
 
                                 result_obj = None
-                                if capture_objects != "off" and not _is_builtin_like(result):
-                                    tmp = _obj_spec(result, include_private_objects, objects_stringify_depth)
+                                if capture_objects != "off" and not _is_builtin_like(
+                                    result
+                                ):
+                                    tmp = _obj_spec(
+                                        result,
+                                        include_private_objects,
+                                        objects_stringify_depth,
+                                    )
                                     if tmp:
                                         result_obj = tmp
                                 # ----------------------------------------------------------------
@@ -462,7 +571,10 @@ Optional capture of simple objects (inputs/outputs)
                                     }
                                 if capture_objects != "off":
                                     if obj_args_pos or obj_args_kw:
-                                        entry["obj_args"] = {"pos": obj_args_pos, "kw": obj_args_kw}
+                                        entry["obj_args"] = {
+                                            "pos": obj_args_pos,
+                                            "kw": obj_args_kw,
+                                        }
                                     if result_obj is not None:
                                         entry["result_obj"] = result_obj
 
@@ -500,4 +612,3 @@ Optional capture of simple objects (inputs/outputs)
         return _build_wrapper(func)
 
     return decorator
-

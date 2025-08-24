@@ -230,6 +230,7 @@ def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog)
 
     # (optional but stabilizes the assertion surface)
     import logging
+
     caplog.set_level(logging.INFO, logger="pytead")
 
     # Packaged defaults (minimal)
@@ -283,6 +284,7 @@ def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog)
 
     # Neutralize real instrumentation (return the targets as "seen")
     import pytead.targets as tg
+
     monkeypatch.setattr(
         tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
     )
@@ -356,4 +358,3 @@ def test_env_yaml_via_pytead_config(tmp_path, monkeypatch):
     assert ns.format == "repr"
     assert str(ns.storage_dir).endswith("call_logs")
     assert ns.targets == ["pkg.mod.fn"]
-

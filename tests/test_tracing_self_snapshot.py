@@ -17,8 +17,10 @@ FMT_BY_EXT = {
     ".repr": "repr",
 }
 
+
 def _format_for_storage(storage) -> str:
     return FMT_BY_EXT[storage.extension]
+
 
 def _load_entries_normed(dirpath: Path, storage) -> list[dict]:
     """Lecture normalisée via iter_entries pour rendre les assertions stables."""
@@ -191,4 +193,3 @@ def test_json_and_repr_roundtrip_with_self(tmp_path: Path, StorageCls: Type):
     assert isinstance(e["self"]["after"]["items"], (list, tuple))
     assert e["self"]["before"]["items"] == [1, 2]
     assert e["self"]["after"]["items"] == [1, 2, 3, 4]
-

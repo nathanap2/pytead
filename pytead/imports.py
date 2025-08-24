@@ -8,18 +8,47 @@ import sys
 
 Pathish = Union[str, os.PathLike[str], Path]
 
+def detect_project_root(
+    start: Optional[Pathish],
+    *,
+    markers: Iterable[str] = (".pytead", "pyproject.toml"),
+    fallback: Literal["cwd", "parent"] = "cwd",
+) -> Path:
+    """
+    Ascend from `start` (or CWD if None) until a directory containing any `markers`
+    is found and return it. If none is found:
+      - fallback="cwd"    -> Path.cwd().resolve()
+      - fallback="parent" -> base.parent.resolve(), where base = resolve(start or CWD)
+    Includes `start` in the search; ignores access errors; does not mutate sys.path.
+    """
+    base = Path(start).resolve() if start is not None else Path.cwd().resolve()
+
+    for p in [base, *base.parents]:
+        try:
+            if any((p / m).exists() for m in markers):
+                return p
+        except Exception:
+            # Ignore unreadable directories and keep walking upward.
+            continue
+
+    if fallback == "cwd":
+        return Path.cwd().resolve()
+    if fallback == "parent":
+        return base.parent.resolve()
+    raise ValueError("fallback must be 'cwd' or 'parent'")
+
+
 
 def _auto_detect_project_root(start: Optional[Path]) -> Path:
     """
-    Best-effort project root detection:
-      - From `start` (script dir) upward: directory containing '.pytead' or 'pyproject.toml'
-      - Fallback: CWD
+    Backward-compatible helper used internally
     """
-    base = (start or Path.cwd()).resolve()
-    for p in [base] + list(base.parents):
-        if (p / ".pytead").exists() or (p / "pyproject.toml").exists():
-            return p
-    return Path.cwd().resolve()
+    return detect_project_root(start, fallback="cwd")
+
+    
+
+
+
 
 
 def _to_abs_dir(p: Path) -> Path | None:
@@ -44,7 +73,9 @@ def compute_import_roots(
     """
     roots: list[Path] = []
     proj_root = project_root or _auto_detect_project_root(
-        Path(script_path).parent if (script_path and str(script_path).endswith(".py")) else None
+        Path(script_path).parent
+        if (script_path and str(script_path).endswith(".py"))
+        else None
     )
 
     # 1) script dir
@@ -61,7 +92,7 @@ def compute_import_roots(
         roots.append(pr)
 
     # 3) additionals
-    for raw in (additional or []):
+    for raw in additional or []:
         p = Path(raw)
         abs_p = p if p.is_absolute() else (proj_root / p)
         ap = _to_abs_dir(abs_p)
@@ -99,4 +130,3 @@ def prepend_sys_path(roots: Iterable[Pathish]) -> None:
     for s in reversed(normed):
         if s not in sys.path:
             sys.path.insert(0, s)
-

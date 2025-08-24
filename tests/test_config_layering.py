@@ -117,4 +117,3 @@ run:
 
     # No local config detected -> no project anchoring file
     assert ctx.source_path is None
-

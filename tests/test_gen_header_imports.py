@@ -36,7 +36,9 @@ def _assert_passed(stdout: str, expected: int) -> None:
     if not m:
         raise AssertionError(f"'passed' count not found in pytest output:\n{stdout}")
     got = int(m.group(1))
-    assert got == expected, f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
+    assert (
+        got == expected
+    ), f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
 
 
 def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
@@ -69,7 +71,9 @@ def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
 
     res = _run_pytest_in(root)
     if res.returncode != 0:
-        raise AssertionError(f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+        raise AssertionError(
+            f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
     _assert_passed(res.stdout, expected=2)
 
 
@@ -90,7 +94,6 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
             return a * b
         """,
     )
-
 
     _w(
         root / ".pytead/config.toml",
@@ -142,6 +145,7 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
     # Lance pytest et vérifie le bon nombre de cas (2)
     res = _run_pytest_in(root)
     if res.returncode != 0:
-        raise AssertionError(f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
+        raise AssertionError(
+            f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
+        )
     _assert_passed(res.stdout, expected=2)
-

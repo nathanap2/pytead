@@ -12,7 +12,6 @@ from .typing_defs import StorageLike, TraceEntry
 log = logging.getLogger("pytead.storage")
 
 
-
 def _is_scalar_literal(x: Any) -> bool:
     return isinstance(x, (str, int, float, bool, type(None)))
 
@@ -67,9 +66,12 @@ class PickleStorage(_BaseStorage):
     # (keep the atomic dump version only in your real file)
     def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         import os, tempfile
+
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(path.parent)) as tmp:
+            with tempfile.NamedTemporaryFile(
+                "wb", delete=False, dir=str(path.parent)
+            ) as tmp:
                 pickle.dump(entry, tmp)
                 tmp_name = tmp.name
             os.replace(tmp_name, path)
@@ -88,10 +90,16 @@ class PickleStorage(_BaseStorage):
 
 class JsonStorage(_BaseStorage):
     extension = ".json"
+
     def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         try:
             with path.open("w", encoding="utf-8") as f:
-                json.dump(entry, f, ensure_ascii=False, default=lambda o: o if json.dumps(o, default=str) else repr(o))
+                json.dump(
+                    entry,
+                    f,
+                    ensure_ascii=False,
+                    default=lambda o: o if json.dumps(o, default=str) else repr(o),
+                )
         except Exception as exc:
             log.error("Failed to write json %s: %s", path, exc)
 
@@ -104,8 +112,10 @@ class JsonStorage(_BaseStorage):
             data["kwargs"] = {}
         return data
 
+
 class ReprStorage(_BaseStorage):
     extension = ".repr"
+
     def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
         try:
             # 🔧 NEW: force a literal-friendly structure before pretty-printing
@@ -134,7 +144,11 @@ def get_storage(name: Optional[str]) -> StorageLike:
     try:
         return _REGISTRY[name]
     except KeyError:
-        raise ValueError("Unknown storage format '{}'. Available: {}".format(name, list(_REGISTRY.keys())))
+        raise ValueError(
+            "Unknown storage format '{}'. Available: {}".format(
+                name, list(_REGISTRY.keys())
+            )
+        )
 
 
 def storages_from_names(names: Optional[List[str]]) -> List[StorageLike]:
@@ -143,7 +157,9 @@ def storages_from_names(names: Optional[List[str]]) -> List[StorageLike]:
     return [get_storage(n) for n in names]
 
 
-def iter_entries(calls_dir: Path, formats: Optional[List[str]] = None) -> Iterable[TraceEntry]:
+def iter_entries(
+    calls_dir: Path, formats: Optional[List[str]] = None
+) -> Iterable[TraceEntry]:
     for st in storages_from_names(formats):
         for p in sorted(calls_dir.glob(f"*{st.extension}")):
             try:

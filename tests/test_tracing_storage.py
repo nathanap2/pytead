@@ -133,4 +133,3 @@ def test_repr_storage_preserves_int_keys(tmp_path: Path):
     assert (2, 3) in e["kwargs"] and e["kwargs"][(2, 3)] == "b"
     assert 10 in e["result"] and e["result"][10] == "x"
     assert (4, 5) in e["result"] and e["result"][(4, 5)] == "y"
-

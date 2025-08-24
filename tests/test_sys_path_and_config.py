@@ -188,6 +188,7 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
 
     # No-op instrumentation : patcher l'endroit correct
     import pytead.targets as tg
+
     monkeypatch.setattr(
         tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
     )
@@ -222,8 +223,10 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
 
         # 2) Chemins attendus
         assert str((repo / "app").resolve()) in sys.path  # script dir
-        assert str(repo.resolve()) in sys.path            # base path
-        assert str((repo / "logical_entities").resolve()) in sys.path  # additional_sys_path
+        assert str(repo.resolve()) in sys.path  # base path
+        assert (
+            str((repo / "logical_entities").resolve()) in sys.path
+        )  # additional_sys_path
 
         # 3) Logs d’instrumentation
         log_text = "\n".join(r.message for r in caplog.records)
@@ -271,6 +274,7 @@ def test_cmd_run_resolves_relative_additional_sys_path(tmp_path, monkeypatch, ca
     # No-op exécution & instrumentation
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
     import pytead.targets as tg
+
     monkeypatch.setattr(
         tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
     )
@@ -313,6 +317,7 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
     # No-op exécution & instrumentation
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
     import pytead.targets as tg
+
     monkeypatch.setattr(
         tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
     )
@@ -341,12 +346,13 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
 
         # Chemins présents
         assert str((repo / "app").resolve()) in sys.path  # script dir
-        assert str(repo.resolve()) in sys.path            # base path
-        assert str((repo / "logical_entities").resolve()) in sys.path  # additional_sys_path
+        assert str(repo.resolve()) in sys.path  # base path
+        assert (
+            str((repo / "logical_entities").resolve()) in sys.path
+        )  # additional_sys_path
 
         # Logs (au moins une des cibles doit apparaître)
         log_text = "\n".join(r.message for r in caplog.records)
         assert ("ioutils.render_json" in log_text) or ("adjacent_mod.echo" in log_text)
     finally:
         os.chdir(old_cwd)
-

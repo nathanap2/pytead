@@ -10,19 +10,25 @@ from pytead.gen_tests import collect_entries
 
 # --- bloc A : literalization ---
 
+
 class MonsterFactory:
     def __init__(self, species: str, level: int):
         self.species = species
         self.level = level
+
     def __repr__(self) -> str:
         return self.species  # non-literal repr
+
 
 def create_monster(cfg: dict, _Monster=MonsterFactory):  # fige la classe ici
     return _Monster(cfg["species"], cfg["level"])
 
+
 def test_repr_storage_writes_literal_structure(tmp_path: Path):
     calls = tmp_path / "calls"
-    wrapped = trace(storage_dir=calls, storage=ReprStorage(), capture_objects="simple")(create_monster)
+    wrapped = trace(storage_dir=calls, storage=ReprStorage(), capture_objects="simple")(
+        create_monster
+    )
     wrapped({"species": "Tree", "level": 36})
 
     files = list(calls.glob("*.repr"))
@@ -37,7 +43,9 @@ def test_repr_storage_writes_literal_structure(tmp_path: Path):
 
 def test_collect_entries_reads_repr_after_patch(tmp_path: Path):
     calls = tmp_path / "calls"
-    wrapped = trace(storage_dir=calls, storage=ReprStorage(), capture_objects="simple")(create_monster)
+    wrapped = trace(storage_dir=calls, storage=ReprStorage(), capture_objects="simple")(
+        create_monster
+    )
     wrapped({"species": "Tree", "level": 36})
     entries = collect_entries(calls, formats=["repr"])
     key = next(k for k in entries if k.endswith(".create_monster"))
@@ -48,32 +56,41 @@ def test_collect_entries_reads_repr_after_patch(tmp_path: Path):
 
 def test_json_storage_always_parses(tmp_path: Path):
     calls = tmp_path / "calls"
-    wrapped = trace(storage_dir=calls, storage=PickleStorage(), capture_objects="simple")(create_monster)
+    wrapped = trace(
+        storage_dir=calls, storage=PickleStorage(), capture_objects="simple"
+    )(create_monster)
     wrapped({"species": "Tree", "level": 36})
     assert True  # this test is just a placeholder for json/pickle paths
 
+
 # --- bloc B : depth1 stringify ---
+
 
 class Owner:
     def __repr__(self):
         return "Owner#42"
 
+
 class Bare:
     pass
 
+
 class MonsterDeep:
     __slots__ = ("name", "owner", "tags", "meta")
+
     def __init__(self):
         self.name = "Tree"
         self.owner = Owner()
         self.tags = [Bare(), 1, "x"]
         self.meta = {"k": Bare()}
 
+
 def make():
     return MonsterDeep()
 
 
 from pprint import pformat
+
 
 def _repr_payloads_for_make(calls: Path) -> dict[str, dict]:
     """
@@ -90,6 +107,7 @@ def _repr_payloads_for_make(calls: Path) -> dict[str, dict]:
         if isinstance(data, dict) and str(data.get("func", "")).endswith(".make"):
             out[f.name] = data
     return out
+
 
 def test_depth1_stringify(tmp_path: Path):
     calls = tmp_path / "calls"
@@ -117,7 +135,11 @@ def test_depth1_stringify(tmp_path: Path):
     st = e["result_obj"].get("state")
     if not isinstance(st, dict) or "owner" not in st:
         payloads = _repr_payloads_for_make(calls)
-        st_info = f"type={type(st).__name__}" if not isinstance(st, dict) else f"keys={list(st.keys())}"
+        st_info = (
+            f"type={type(st).__name__}"
+            if not isinstance(st, dict)
+            else f"keys={list(st.keys())}"
+        )
         pytest.fail(
             "Clé 'owner' absente dans result_obj.state.\n"
             f"state info   : {st_info}\n"
@@ -133,8 +155,6 @@ def test_depth1_stringify(tmp_path: Path):
     assert st["meta"]["k"].endswith("Bare")
 
 
-
-
 def _repr_payloads_for_make(calls: Path) -> dict[str, dict]:
     out = {}
     for f in sorted(calls.glob("*.repr")):
@@ -146,6 +166,7 @@ def _repr_payloads_for_make(calls: Path) -> dict[str, dict]:
         if isinstance(data, dict) and str(data.get("func", "")).endswith(".make"):
             out[f.name] = data
     return out
+
 
 def _describe_instance(x: Any) -> str:
     try:
@@ -172,18 +193,27 @@ def _describe_instance(x: Any) -> str:
         except Exception as exc:
             lines.append(f"  - {name}: <getattr error: {exc!r}>")
     return "\n".join(lines)
-    
+
+
 def test__obj_spec_sanity_for_slots_depth1():
+    """
+    À depth=1, la référence attendue est : énumération (__dict__ + __slots__)
+    puis _stringify_level1 sur les valeurs de 1er niveau (PAS snapshot→stringify).
+    """
     m = make()  # MonsterDeep()
-    # Rejoue la logique attendue : snapshot canonique + stringify(1)
-    from pytead.tracing import _snapshot_object, _stringify_level1, _qualtype
-    base = _snapshot_object(m, include_private=True)
-    state = {k: _stringify_level1(v) for k, v in base.items()}
-    assert state["owner"] == "Owner#42"
-    assert isinstance(state["tags"], list) and str(state["tags"][0]).endswith("Bare")
-    assert state["meta"]["k"].endswith("Bare")
+    ref = _ref_depth1_state(m)
+    assert ref["owner"] == "Owner#42"
+    assert isinstance(ref["tags"], list)
+    assert isinstance(ref["tags"][0], str) and (
+        ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare")
+    )
+    assert isinstance(ref["meta"], dict)
+    assert isinstance(ref["meta"]["k"], str) and (
+        ref["meta"]["k"].endswith("Bare") or ref["meta"]["k"].endswith(".Bare")
+    )
 
 
+# Remplace la fonction existante
 def test_depth1_stringify(tmp_path: Path):
     calls = tmp_path / "calls"
     wrapped = trace(
@@ -193,64 +223,28 @@ def test_depth1_stringify(tmp_path: Path):
         objects_stringify_depth=1,
     )(make)
 
-    # Exécute et récupère l'instance renvoyée pour introspection locale
-    inst = wrapped()
-
+    _ = wrapped()
     entries = collect_entries(calls, formats=["repr"])
     key = next(k for k in entries if k.endswith(".make"))
     e = entries[key][0]
 
-    # Diagnostics supplémentaires côté instance
-    try:
-        from pytead.tracing import _snapshot_object, _stringify_level1  # type: ignore
-        pub_snap = _snapshot_object(inst, include_private=False)
-        all_snap = _snapshot_object(inst, include_private=True)
-        pub_str1 = {k: _stringify_level1(v) for k, v in pub_snap.items()}
-        all_str1 = {k: _stringify_level1(v) for k, v in all_snap.items()}
-    except Exception as exc:
-        pub_snap = all_snap = pub_str1 = all_str1 = {"__introspection_error__": repr(exc)}
+    assert "result_obj" in e, f"result_obj manquant. Entry={pformat(e)}"
+    st = e["result_obj"].get("state") or {}
 
-    # Garde-fous + diagnostics enrichis
-    if "result_obj" not in e:
-        payloads = _repr_payloads_for_make(calls)
-        pytest.fail(
-            "result_obj manquant dans l'entrée collectée.\n"
-            f"Entry keys   : {sorted(e.keys())}\n"
-            f"Entry dump   : {pformat(e)}\n\n"
-            f"Instance description:\n{_describe_instance(inst)}\n\n"
-            f"snapshot public   : {pformat(pub_snap)}\n"
-            f"snapshot complet  : {pformat(all_snap)}\n"
-            f"stringify1 public : {pformat(pub_str1)}\n"
-            f"stringify1 complet: {pformat(all_str1)}\n\n"
-            f".repr payloads (make):\n{pformat(payloads)}"
-        )
-
-    st = e["result_obj"].get("state")
-
-    if not isinstance(st, dict) or "owner" not in st:
-        payloads = _repr_payloads_for_make(calls)
-        st_info = f"type={type(st).__name__}" if not isinstance(st, dict) else f"keys={list(st.keys())}"
-        pytest.fail(
-            "Clé 'owner' absente dans result_obj.state.\n"
-            f"state info         : {st_info}\n"
-            f"result_obj         : {pformat(e['result_obj'])}\n"
-            f"Entry dump         : {pformat(e)}\n\n"
-            f"Instance description:\n{_describe_instance(inst)}\n\n"
-            f"snapshot public    : {pformat(pub_snap)}\n"
-            f"snapshot complet   : {pformat(all_snap)}\n"
-            f"stringify1 public  : {pformat(pub_str1)}\n"
-            f"stringify1 complet : {pformat(all_str1)}\n\n"
-            f".repr payloads (make):\n{pformat(payloads)}"
-        )
-
-    # Assertions d’origine
+    # Comportement attendu à depth=1
     assert st["owner"] == "Owner#42"
     assert isinstance(st["tags"], list)
-    assert st["tags"][0].endswith("Bare")
-    assert st["meta"]["k"].endswith("Bare")
-    
-    
+    assert isinstance(st["tags"][0], str) and (
+        st["tags"][0].endswith("Bare") or st["tags"][0].endswith(".Bare")
+    )
+    assert isinstance(st["meta"], dict)
+    assert isinstance(st["meta"]["k"], str) and (
+        st["meta"]["k"].endswith("Bare") or st["meta"]["k"].endswith(".Bare")
+    )
+
+
 # --- bloc C : micro-diagnostics sur repr/regex/stringify (à ajouter en fin de fichier) ---
+
 
 def test_diag_opaque_repr_detection():
     """
@@ -258,6 +252,7 @@ def test_diag_opaque_repr_detection():
     et si _safe_repr_or_classname(...) retourne un nom de classe plutôt que le repr brut.
     """
     from pytead.tracing import _safe_repr_or_classname, _OPAQUE_REPR_RE
+
     b = Bare()
     r = repr(b)
     pattern = getattr(_OPAQUE_REPR_RE, "pattern", "<no pattern attr>")
@@ -266,7 +261,9 @@ def test_diag_opaque_repr_detection():
 
     # Assertions avec messages verbeux pour bien voir l'état courant
     assert m, f"Opaque repr non détecté par le regex.\nrepr={r!r}\npattern={pattern!r}"
-    assert isinstance(s, str), f"_safe_repr_or_classname(b) n'a pas renvoyé une str: {type(s)}"
+    assert isinstance(
+        s, str
+    ), f"_safe_repr_or_classname(b) n'a pas renvoyé une str: {type(s)}"
     assert s.endswith("Bare") or s.endswith(".Bare"), (
         "_safe_repr_or_classname(b) ne renvoie pas un nom lisible de classe.\n"
         f"repr={r!r}\npattern={pattern!r}\nreturned={s!r}"
@@ -278,9 +275,12 @@ def test_diag_stringify_level1_owner_atom():
     _stringify_level1(Owner()) doit donner 'Owner#42' (repr explicite).
     """
     from pytead.tracing import _stringify_level1
+
     o = Owner()
     so = _stringify_level1(o)
-    assert so == "Owner#42", f"_stringify_level1(Owner()) -> {so!r} (attendu 'Owner#42')"
+    assert (
+        so == "Owner#42"
+    ), f"_stringify_level1(Owner()) -> {so!r} (attendu 'Owner#42')"
 
 
 def test_diag_stringify_level1_list_with_object_first():
@@ -289,11 +289,16 @@ def test_diag_stringify_level1_list_with_object_first():
     avec un premier élément string qui finit par 'Bare'.
     """
     from pytead.tracing import _stringify_level1
+
     out = _stringify_level1([Bare(), 1, "x"])
     assert isinstance(out, list), f"type(out)={type(out)} valeur={out!r}"
     first = out[0]
-    assert isinstance(first, str), f"out[0] n'est pas une str: {type(first)} valeur={first!r}"
-    assert first.endswith("Bare") or first.endswith(".Bare"), f"out[0]={first!r} ne finit pas par 'Bare'"
+    assert isinstance(
+        first, str
+    ), f"out[0] n'est pas une str: {type(first)} valeur={first!r}"
+    assert first.endswith("Bare") or first.endswith(
+        ".Bare"
+    ), f"out[0]={first!r} ne finit pas par 'Bare'"
 
 
 def test_diag_stringify_level1_dict_with_object_value():
@@ -301,13 +306,18 @@ def test_diag_stringify_level1_dict_with_object_value():
     _stringify_level1 sur un dict {'k': Bare()} doit produire {'k': '<nom-de-classe>'}.
     """
     from pytead.tracing import _stringify_level1
+
     out = _stringify_level1({"k": Bare()})
     assert isinstance(out, dict), f"type(out)={type(out)} valeur={out!r}"
     v = out.get("k")
     assert isinstance(v, str), f"out['k'] n'est pas une str: {type(v)} valeur={v!r}"
-    assert v.endswith("Bare") or v.endswith(".Bare"), f"out['k']={v!r} ne finit pas par 'Bare'"
+    assert v.endswith("Bare") or v.endswith(
+        ".Bare"
+    ), f"out['k']={v!r} ne finit pas par 'Bare'"
+
 
 # --- bloc D : diagnostics de pipeline snapshot -> stringify -> trace ---
+
 
 def test_diag_snapshot_object_monsterdeep():
     """
@@ -317,15 +327,24 @@ def test_diag_snapshot_object_monsterdeep():
       - 'tags[0]' (Bare()) et 'meta["k"]' deviennent déjà des str du type '<... object at 0x...>'.
     """
     from pytead.tracing import _snapshot_object
+
     m = make()
     base = _snapshot_object(m, include_private=True)
 
     assert set(base.keys()) == {"name", "owner", "tags", "meta"}
     assert base["owner"] == "Owner#42"  # repr explicite de Owner()
     assert isinstance(base["tags"], list) and len(base["tags"]) >= 1
-    assert isinstance(base["tags"][0], str) and base["tags"][0].startswith("<") and " object at 0x" in base["tags"][0]
+    assert (
+        isinstance(base["tags"][0], str)
+        and base["tags"][0].startswith("<")
+        and " object at 0x" in base["tags"][0]
+    )
     assert isinstance(base["meta"], dict) and "k" in base["meta"]
-    assert isinstance(base["meta"]["k"], str) and base["meta"]["k"].startswith("<") and " object at 0x" in base["meta"]["k"]
+    assert (
+        isinstance(base["meta"]["k"], str)
+        and base["meta"]["k"].startswith("<")
+        and " object at 0x" in base["meta"]["k"]
+    )
 
 
 def test_diag_stringify_level1_sur_snapshot():
@@ -334,6 +353,7 @@ def test_diag_stringify_level1_sur_snapshot():
     Le passage snapshot -> stringify(1) garde donc ces chaînes telles quelles.
     """
     from pytead.tracing import _snapshot_object, _stringify_level1
+
     m = make()
     base = _snapshot_object(m, include_private=True)
     state = {k: _stringify_level1(v) for k, v in base.items()}
@@ -350,35 +370,14 @@ def test_diag_stringify_level1_sur_repr_string():
     Si on donne directement à _stringify_level1 une chaîne de repr opaque, elle est renvoyée telle quelle.
     """
     from pytead.tracing import _stringify_level1
+
     s = repr(Bare())
     out = _stringify_level1(s)
     assert out == s
 
 
-def test_diag_trace_pipeline_depth1_comportement_actuel(tmp_path: Path):
-    """
-    Comportement actuel end-to-end avec objects_stringify_depth=1 :
-      - result_obj présent,
-      - state['owner'] == 'Owner#42',
-      - state['tags'][0] reste une str opaque du type '<...Bare object at 0x...>'.
-    """
-    calls = tmp_path / "calls"
-    wrapped = trace(
-        storage_dir=calls,
-        storage=ReprStorage(),
-        capture_objects="simple",
-        objects_stringify_depth=1,
-    )(make)
-    _ = wrapped()
-    entries = collect_entries(calls, formats=["repr"])
-    key = next(k for k in entries if k.endswith(".make"))
-    st = entries[key][0]["result_obj"]["state"]
-
-    assert st["owner"] == "Owner#42"
-    assert isinstance(st["tags"], list) and isinstance(st["tags"][0], str)
-    assert st["tags"][0].startswith("<") and " object at 0x" in st["tags"][0]
-
 # --- bloc E : diagnostics ciblés sur depth=1 ---
+
 
 def _ref_collect_slots(cls):
     """Collecte __slots__ le long de la MRO (helper local au test)."""
@@ -396,12 +395,14 @@ def _ref_collect_slots(cls):
         pass
     return names
 
+
 def _ref_depth1_state(x):
     """
     Référence "idéale" pour depth=1 : on énumère __dict__ + __slots__ et on applique
     _stringify_level1 aux valeurs de premier niveau (sans passer par _snapshot_object).
     """
     from pytead.tracing import _stringify_level1
+
     state = {}
     d = getattr(x, "__dict__", None)
     if isinstance(d, dict):
@@ -422,10 +423,11 @@ def _ref_depth1_state(x):
 
 def test_diag_depth1_obj_spec_appelle_snapshot(monkeypatch, tmp_path: Path):
     """
-    Vérifie que, dans l'implémentation actuelle, le chemin depth=1 passe bien par
-    _snapshot_object (ce qui explique les repr opaques dans les champs imbriqués).
+    À depth=1, _obj_spec n'utilise plus _snapshot_object ; on énumère __dict__/__slots__
+    et on stringifie à 1 niveau. Ce test vérifie donc que _snapshot_object n'est PAS invoqué.
     """
     import pytead.tracing as tr
+
     called = {"snapshot": 0}
     orig = tr._snapshot_object
 
@@ -437,15 +439,17 @@ def test_diag_depth1_obj_spec_appelle_snapshot(monkeypatch, tmp_path: Path):
 
     calls = tmp_path / "calls"
     wrapped = trace(
-        storage_dir=calls, storage=ReprStorage(),
-        capture_objects="simple", objects_stringify_depth=1
+        storage_dir=calls,
+        storage=ReprStorage(),
+        capture_objects="simple",
+        objects_stringify_depth=1,
     )(make)
     _ = wrapped()
 
     entries = collect_entries(calls, formats=["repr"])
     key = next(k for k in entries if k.endswith(".make"))
     assert "result_obj" in entries[key][0], "result_obj absent (régression inattendue)"
-    assert called["snapshot"] >= 1, "Le chemin depth=1 n'a pas invoqué _snapshot_object (comportement inattendu)"
+    assert called["snapshot"] == 0, "Depth=1 ne devrait pas invoquer _snapshot_object"
 
 
 def test_diag_depth1_reference_state_has_classnames():
@@ -454,52 +458,57 @@ def test_diag_depth1_reference_state_has_classnames():
     lisibles pour les objets imbriqués (ex: '...Bare'), et conserve 'Owner#42'.
     """
     from pytead.tracing import _safe_repr_or_classname
+
     m = make()
     ref = _ref_depth1_state(m)
 
     assert ref["owner"] == "Owner#42"
     assert isinstance(ref["tags"], list)
-    assert isinstance(ref["tags"][0], str) and (ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare"))
-    assert isinstance(ref["meta"], dict) and isinstance(ref["meta"]["k"], str) and (
-        ref["meta"]["k"].endswith("Bare") or ref["meta"]["k"].endswith(".Bare")
+    assert isinstance(ref["tags"][0], str) and (
+        ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare")
+    )
+    assert (
+        isinstance(ref["meta"], dict)
+        and isinstance(ref["meta"]["k"], str)
+        and (ref["meta"]["k"].endswith("Bare") or ref["meta"]["k"].endswith(".Bare"))
     )
 
 
 def test_diag_compare_trace_state_vs_reference_depth1(tmp_path: Path):
     """
-    Compare l'état capturé par la lib (pipeline actuelle) et la "référence" depth=1.
-    On vérifie qu'ils ont les mêmes clés, et on documente où ça diverge (tags[0], meta['k']).
+    Compare l'état capturé par la lib (depth=1 sans snapshot) et la
+    référence _ref_depth1_state : ils doivent coïncider structurellement et
+    sur les rendus 'nom de classe' attendus pour les objets de niveau 1.
     """
     calls = tmp_path / "calls"
     wrapped = trace(
-        storage_dir=calls, storage=ReprStorage(),
-        capture_objects="simple", objects_stringify_depth=1
+        storage_dir=calls,
+        storage=ReprStorage(),
+        capture_objects="simple",
+        objects_stringify_depth=1,
     )(make)
+
     inst = wrapped()
 
     entries = collect_entries(calls, formats=["repr"])
     key = next(k for k in entries if k.endswith(".make"))
     st = entries[key][0]["result_obj"]["state"]
-    ref = _ref_depth1_state(inst)
+    ref = _ref_depth1_state(inst)  # helper défini plus haut
 
     # même structure globale
     assert set(st.keys()) == set(ref.keys()) == {"name", "owner", "tags", "meta"}
 
-    # 'owner' déjà OK
-    assert st["owner"] == "Owner#42" == ref["owner"]
+    # valeurs alignées
+    assert st["owner"] == ref["owner"] == "Owner#42"
 
-    # Documente précisément la divergence attendue aujourd'hui
-    def _is_opaque(s: str) -> bool:
-        return isinstance(s, str) and s.startswith("<") and " object at 0x" in s and s.endswith(">")
-
-    # tags[0]
     assert isinstance(st["tags"], list) and isinstance(ref["tags"], list)
     assert isinstance(st["tags"][0], str) and isinstance(ref["tags"][0], str)
-    # Aujourd'hui: st -> repr opaque ; ref -> nom de classe
-    assert _is_opaque(st["tags"][0]) and (ref["tags"][0].endswith("Bare") or ref["tags"][0].endswith(".Bare"))
+    assert st["tags"][0] == ref["tags"][0] and (
+        st["tags"][0].endswith("Bare") or st["tags"][0].endswith(".Bare")
+    )
 
-    # meta['k']
-    kval, kval_ref = st["meta"]["k"], ref["meta"]["k"]
-    assert isinstance(kval, str) and isinstance(kval_ref, str)
-    assert _is_opaque(kval) and (kval_ref.endswith("Bare") or kval_ref.endswith(".Bare"))
-
+    assert isinstance(st["meta"], dict) and isinstance(ref["meta"], dict)
+    assert isinstance(st["meta"]["k"], str) and isinstance(ref["meta"]["k"], str)
+    assert st["meta"]["k"] == ref["meta"]["k"] and (
+        st["meta"]["k"].endswith("Bare") or st["meta"]["k"].endswith(".Bare")
+    )

@@ -14,9 +14,9 @@ log = logging.getLogger("pytead.targets")
 
 @dataclass(frozen=True)
 class ResolvedTarget:
-    owner: Any   # module or class that owns the attribute
-    attr: str    # attribute name on owner
-    kind: str    # "func" | "instancemethod" | "classmethod" | "staticmethod"
+    owner: Any  # module or class that owns the attribute
+    attr: str  # attribute name on owner
+    kind: str  # "func" | "instancemethod" | "classmethod" | "staticmethod"
 
 
 def _import_longest_prefix(fq: str):
@@ -194,4 +194,3 @@ def instrument_targets(
         raise TargetResolutionError("\n".join(errors))
 
     return seen
-
