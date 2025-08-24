@@ -8,9 +8,8 @@ from typing import Any, Dict, List, Union, Optional
 
 from .storage import iter_entries
 from ._cases import (
-    case_id,
-    unique_cases_with_objs,
-    render_case_septuple,
+    unique_cases,
+    render_case,
 )
 
 
@@ -63,12 +62,12 @@ def render_tests(
         module_sanitized = module_path.replace(".", "_") if module_path else "root"
         sym_cases = f"CASES_{module_sanitized}_{func_name}"
 
-        cases = unique_cases_with_objs(entries)
+        cases = unique_cases(entries)
 
         # Déclaration unique des cas (7-tuple) pour cette fonction
         lines.append(f"{sym_cases} = [")
         for c in cases:
-            lines.extend(render_case_septuple(c, base_indent=4))
+            lines.extend(render_case(c, base_indent=4))
         lines.append("]")
         lines.append("")
 

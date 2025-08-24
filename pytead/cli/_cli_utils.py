@@ -5,8 +5,7 @@ from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 from .config_cli import diagnostics_for_storage_dir
 
-
-from .._cases import unique_cases_with_objs
+from .._cases import unique_cases
 
 
 __all__ = [
@@ -64,11 +63,9 @@ def split_targets_and_cmd(
 def unique_count(entries_by_func: Dict[str, List[Dict[str, Any]]]) -> int:
     """
     Return the total number of unique test cases across all functions.
-
-    Uniqueness is determined by `unique_cases(...)`, which normalizes
-    (args, kwargs, expected) and deduplicates identical triples.
     """
-    return sum(len(unique_cases_with_objs(entries)) for entries in entries_by_func.values())
+    return sum(len(unique_cases(entries)) for entries in entries_by_func.values())
+
 
 
 def fallback_targets_from_cfg(

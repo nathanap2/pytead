@@ -1,23 +1,25 @@
 # pytead/testkit.py
 from __future__ import annotations
 from typing import Iterable, Tuple, Any, List, Union, Optional, Sequence
-import os
 from os import PathLike
+
+# Il n'est plus nécessaire d'importer TraceCase ici
 from ._cases import case_id as _case_id
 from .rt import (
     ensure_import_roots, resolve_attr, rehydrate,
     drop_self_placeholder, inject_object_args, assert_object_state,
 )
 
-__all__ = ["Case", "setup", "run_case", "param_ids"]
+# On peut retirer TraceCase de __all__ car il n'est plus utilisé par les tests générés
+__all__ = ["setup", "run_case", "param_ids"]
 
-# Tuple schema used in generated tests
+# Le type hint redevient un Tuple, ce qui correspond à ce qui est généré
 Case = Tuple[tuple, dict, Any, Optional[str], Optional[dict], Optional[dict], Optional[dict]]
 
 def setup(here_file: Union[str, PathLike[str]], import_roots: Iterable[Union[str, PathLike[str]]]) -> None:
     """
     Prepare sys.path for generated tests. Relative paths are anchored on the
-    project root (auto-détecté autour de `here_file`).
+    project root (auto-detected around `here_file`).
     """
     ensure_import_roots(here_file, import_roots)
 
@@ -27,7 +29,9 @@ def run_case(func_fq: str, case: Case) -> None:
     Case schema (7-tuple):
       (args, kwargs, expected, self_type, self_state, obj_args, result_spec)
     """
+    # On décompose le tuple reçu
     args, kwargs, expected, self_type, self_state, obj_args, result_spec = case
+    
     if self_type:
         inst = rehydrate(self_type, self_state)
         method_name = func_fq.rsplit(".", 1)[1]
@@ -48,7 +52,11 @@ def run_case(func_fq: str, case: Case) -> None:
         assert out == expected
 
 def param_ids(cases: Sequence[Case], maxlen: int = 80) -> List[str]:
+    """
+    Generates readable IDs for pytest.parametrize from a sequence of cases.
+    """
     ids: List[str] = []
+    # On décompose le tuple directement dans la boucle
     for args, kwargs, *_ in cases:
         ids.append(_case_id(args, kwargs, maxlen=maxlen))
     return ids
