@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List, Union, Optional
+from typing import Iterable, List, Union, Optional, Literal
 import os
 import sys
 

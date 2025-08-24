@@ -24,7 +24,7 @@ class TraceEntry(TypedDict, total=False):
 class StorageLike(Protocol):
     extension: str
 
-    def make_path(self, storage_dir: Path, func_fullname: str):
+    def make_path(self, storage_dir: Path, func_fullname: str) -> Path:
         ...
 
     def dump(self, entry: dict, path: Path) -> None:

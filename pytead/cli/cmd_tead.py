@@ -20,13 +20,9 @@ from ..gen_tests import collect_entries, render_tests, write_tests, write_tests_
 from ..targets import instrument_targets, resolve_target
 from ..rt import resolve_attr
 from ..tracing import trace as trace_decorator
+from ._cli_utils import first_py_token as _first_py_token, resolve_under
 
 
-def _first_py_token(tokens) -> Optional[Path]:
-    for tok in tokens or []:
-        if isinstance(tok, str) and tok.endswith(".py"):
-            return Path(tok).resolve()
-    return None
 
 
 def _project_root_from_config_source(src: Optional[Path]) -> Optional[Path]:
@@ -51,14 +47,6 @@ def _peek_wrapped_status(log, fqn: str) -> tuple[bool, str]:
     except Exception:
         file_hint = None
     return is_wrapped, f"wrapped={is_wrapped} module={mod_name!r} file={file_hint!r} obj_id={id(base)}"
-
-
-def _resolve_under(root: Path, p: Optional[Path]) -> Optional[Path]:
-    """Si p est relatif, le rendre relatif à root; sinon retourne p."""
-    if p is None:
-        return None
-    pp = Path(p)
-    return pp if pp.is_absolute() else (root / pp)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -206,66 +194,30 @@ def run(args: argparse.Namespace) -> None:
     # --- 8) Génération — chemins ancrés sur project_root
     out_file = getattr(args, "output", None)
     out_dir = getattr(args, "output_dir", None)
-
     if out_file is None and out_dir is None:
         out_file = project_root / "tests" / "test_pytead_generated.py"
     else:
-        out_file = _resolve_under(project_root, out_file)
-        out_dir = _resolve_under(project_root, out_dir)
+        out_file = resolve_under(project_root, out_file)
+        out_dir = resolve_under(project_root, out_dir)
+        
+    gen_formats = getattr(args, "gen_formats", None)
+    only_targets = sorted(seen_targets) if getattr(args, "only_targets", False) else None
+    import_roots = ordered  # déjà calculé plus haut
 
-    read_formats = getattr(args, "gen_formats", None)
-    only_targets_flag = bool(getattr(args, "only_targets", False))
-
-    try:
-        entries = collect_entries(storage_dir=storage_dir_abs, formats=read_formats)
-    except Exception as exc:
-        log.error("Failed to collect entries in %s: %r", storage_dir_abs, exc)
-        return
-
-    if not entries:
-        log.warning("TEAD: no traces found — aborting generation.")
-        for fqn in sorted(seen_targets):
-            ok, diag = _peek_wrapped_status(log, fqn)
-            log.info("Post-run check %s → %s", fqn, diag)
-        try:
-            for ext in [".pkl", ".json", ".repr"]:
-                files = sorted(p.name for p in storage_dir_abs.glob(f"*{ext}"))
-                log.info("Storage scan (%s): %s", ext, files)
-        except Exception as exc:
-            log.info("Storage scan failed: %r", exc)
-        return
-
-    if only_targets_flag:
-        tgt = set(targets)
-        entries = {k: v for (k, v) in entries.items() if k in tgt}
-        if not entries:
-            log.warning("TEAD: traces exist but none match targets: %s", sorted(tgt))
-            return
-
-    import_roots_for_tests = ["."]
-    import_roots_for_tests += [
-        str(p)
-        for p in (
-            getattr(args, "additional_sys_path", None)
-            or (eff_tead or {}).get("additional_sys_path")
-            or (eff_run or {}).get("additional_sys_path")
-            or []
-        )
-    ]
-
-    total_unique = unique_count(entries)
-
-    if out_dir is not None:
-        out_dir.mkdir(parents=True, exist_ok=True)
-        write_tests_per_func(entries, out_dir, import_roots=import_roots_for_tests)
-        log.info("TEAD: generated %d test modules in '%s' (%d total unique tests).",
-                 len(entries), out_dir, total_unique)
+    from .service_cli import collect_and_emit_tests
+    res = collect_and_emit_tests(
+        storage_dir=storage_dir_abs,
+        formats=gen_formats,
+        output=out_file,
+        output_dir=out_dir,
+        import_roots=import_roots,
+        only_targets=only_targets,
+        logger=log,
+    )
+    if res:
+        log.info("Generated %d unique case(s) across %d file(s).", res.unique_cases, res.files_written)
     else:
-        assert out_file is not None
-        out_file.parent.mkdir(parents=True, exist_ok=True)
-        source = render_tests(entries, import_roots=import_roots_for_tests)
-        write_tests(source, out_file)
-        log.info("TEAD: generated '%s' with %d unique tests.", out_file, total_unique)
+        log.warning("No tests generated (no traces or filter excluded everything).")
 
 
 def add_tead_subparser(subparsers) -> None:

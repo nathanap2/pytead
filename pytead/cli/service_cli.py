@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..imports import compute_import_roots, prepend_sys_path
-from ..targets import instrument_targets as _instrument_targets
 from ..storage import get_storage as _get_storage
 from ..gen_tests import collect_entries, render_tests, write_tests, write_tests_per_func
 from ._cli_utils import unique_count  # optionally swap to a with-self variant
@@ -100,11 +99,15 @@ def instrument_targets(
     """
     Resolve and instrument targets. `storage` may be a StorageLike or a name ("pickle"/"json"/"repr").
     """
+    
+    from ..targets import instrument_targets as targets_instrument
+
     st = _get_storage(storage) if isinstance(storage, str) else storage
-    seen = _instrument_targets(targets, limit=limit, storage_dir=storage_dir, storage=st)
+    seen = targets_instrument(targets, limit=limit, storage_dir=storage_dir, storage=st)
     if logger:
         logger.info("Instrumented %d target(s): %s", len(seen), ", ".join(sorted(seen)))
     return InstrumentResult(seen=frozenset(seen), storage_dir=storage_dir, format_name=st.extension.lstrip("."))
+
 
 
 def run_script(

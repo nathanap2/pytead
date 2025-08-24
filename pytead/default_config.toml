@@ -1,0 +1,14 @@
+[defaults]
+limit = 10
+storage_dir = "call_logs"
+format = "pickle"
+
+[run]
+limit = 7
+
+[gen]
+output_dir = "tests/generated"
+
+[types]
+storage_dir = "call_logs"
+out_dir = "typings"

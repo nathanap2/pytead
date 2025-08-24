@@ -54,30 +54,17 @@ def _load_effective_types_config(args: argparse.Namespace, start: Path | None):
     return ctx, eff_types
 
 
-def _finalize_io_paths(
-    project_root: Path,
-    calls_dir: Path | None,
-    out_dir: Path | None,
-    eff_types: dict,
-):
-    """
-    Resolve calls_dir/out_dir:
-    - CLI flags win if provided,
-    - else use [types].storage_dir for calls_dir and [types].out_dir for out_dir,
-    - anchor relative paths under `project_root`.
-    """
-    # Map config storage_dir -> calls_dir if CLI didn't provide calls_dir
+def _finalize_io_paths(project_root: Path, calls_dir: Path | None, out_dir: Path | None, eff_types: dict):
     if calls_dir is None:
         cfg_calls = eff_types.get("storage_dir")
         calls_dir = _as_path(cfg_calls)
-
     if out_dir is None:
         cfg_out = eff_types.get("out_dir")
         out_dir = _as_path(cfg_out)
-
-    calls_dir = _resolve_under(project_root, calls_dir) if calls_dir else None
-    out_dir = _resolve_under(project_root, out_dir) if out_dir else None
+    calls_dir = resolve_under(project_root, calls_dir) if calls_dir else None
+    out_dir = resolve_under(project_root, out_dir) if out_dir else None
     return calls_dir, out_dir
+
 
 
 def _require(cond: bool, log, msg: str) -> None:

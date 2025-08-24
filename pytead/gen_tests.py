@@ -45,62 +45,37 @@ def render_tests(
     import_roots: Optional[List[Union[str, Path]]] = None,
 ) -> str:
     """
-    Render pytest-compatible test code.
-
-    Parametrization schema per case (7-tuple):
-      ('args', 'kwargs', 'expected', 'self_type', 'self_state', 'obj_args', 'result_spec')
+    Render pytest-compatible test code, déléguant toute l'exécution
+    à pytead.testkit (setup/sys.path, replay et assertions).
     """
     lines: List[str] = []
 
-    # Header with runtime helpers
-    lines.append(
-        "from pytead.rt import ensure_import_roots, resolve_attr, rehydrate, drop_self_placeholder, inject_object_args, assert_object_state"
-    )
+    # En-tête minimal : on utilise le testkit.
+    lines.append("from pytead.testkit import setup as _tk_setup, run_case as _tk_run, param_ids as _tk_ids")
     roots = import_roots if import_roots is not None else ["."]
     joined = ", ".join(repr(str(p)) for p in roots)
-    lines.append(f"ensure_import_roots(__file__, [{joined}])")
+    lines.append(f"_tk_setup(__file__, [{joined}])")
     lines += ["import pytest", ""]
 
     for func_fullname, entries in sorted(entries_by_func.items(), key=lambda kv: kv[0]):
         parts = func_fullname.split(".")
         module_path, func_name = ".".join(parts[:-1]), parts[-1]
         module_sanitized = module_path.replace(".", "_") if module_path else "root"
+        sym_cases = f"CASES_{module_sanitized}_{func_name}"
 
         cases = unique_cases_with_objs(entries)
 
-        lines.append("@pytest.mark.parametrize(")
-        lines.append("    'args, kwargs, expected, self_type, self_state, obj_args, result_spec',")
-        lines.append("    [")
+        # Déclaration unique des cas (7-tuple) pour cette fonction
+        lines.append(f"{sym_cases} = [")
         for c in cases:
-            lines.extend(render_case_septuple(c, base_indent=8))
-        lines.append("    ],")
-        lines.append("    ids=[")
+            lines.extend(render_case_septuple(c, base_indent=4))
+        lines.append("]")
+        lines.append("")
 
-        for c in cases:
-            lines.append(f"        {case_id(c.args, c.kwargs)!r},")
-        lines.append("    ]")
-        lines.append(")")
-        lines.append(
-            f"def test_{module_sanitized}_{func_name}(args, kwargs, expected, self_type, self_state, obj_args, result_spec):"
-        )
-        lines.append(f"    fq = {func_fullname!r}")
-        lines.append("    if self_type:")
-        lines.append("        inst = rehydrate(self_type, self_state)")
-        lines.append("        method_name = fq.rsplit('.', 1)[1]")
-        lines.append("        bound = getattr(inst, method_name)")
-        lines.append("        args = drop_self_placeholder(args, self_type)")
-        lines.append("        args, kwargs = inject_object_args(args, kwargs, obj_args, self_type)")
-        lines.append("        out = bound(*args, **kwargs)")
-        lines.append("    else:")
-        lines.append("        fn = resolve_attr(fq)")
-        lines.append("        args, kwargs = inject_object_args(args, kwargs, obj_args, None)")
-        lines.append("        out = fn(*args, **kwargs)")
-        lines.append("    if result_spec:")
-        lines.append("        typ = resolve_attr(result_spec['type'])")
-        lines.append("        assert isinstance(out, typ), f\"expected instance of {result_spec['type']}\"")
-        lines.append("        assert_object_state(out, result_spec.get('state') or {})")
-        lines.append("    else:")
-        lines.append("        assert out == expected")
+        # Paramétrage compact : un seul paramètre 'case'
+        lines.append(f"@pytest.mark.parametrize('case', {sym_cases}, ids=_tk_ids({sym_cases}))")
+        lines.append(f"def test_{module_sanitized}_{func_name}(case):")
+        lines.append(f"    _tk_run({func_fullname!r}, case)")
         lines.append("")
 
     return "\n".join(lines)

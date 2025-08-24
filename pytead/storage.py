@@ -5,7 +5,7 @@ import pickle
 import pprint
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Callable, IO
 
 from .typing_defs import StorageLike, TraceEntry
 
@@ -43,6 +43,51 @@ def _to_literal(obj: Any) -> Any:
     return repr(obj)
 
 
+
+
+def _atomic_write(
+    path: Path,
+    *,
+    mode: str,
+    write_fn: Callable[[IO[Any]], None],
+    open_kwargs: Optional[dict] = None,
+) -> None:
+    """
+    Write to `path` atomically:
+      - create parent directory,
+      - write to a temporary file in the same directory,
+      - flush + fsync,
+      - os.replace onto the final path,
+      - best-effort cleanup on failure.
+    The caller provides `write_fn(tmp_file)` to perform the actual write.
+    """
+    import os, tempfile
+    tmp_name = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode,
+            delete=False,
+            dir=str(path.parent),
+            **(open_kwargs or {})
+        ) as tmp:
+            write_fn(tmp)
+            try:
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            except Exception:
+                # On some FS (e.g., NFS, Windows text mode), fsync may not be necessary/available.
+                pass
+            tmp_name = tmp.name
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            if tmp_name:
+                os.unlink(tmp_name)
+        except Exception:
+            pass
+        raise
+
 def _json_default(o: Any) -> Any:
     try:
         json.dumps(o)
@@ -62,75 +107,92 @@ class _BaseStorage:
 
 
 class PickleStorage(_BaseStorage):
+    """Binary pickle-based storage with atomic writes."""
     extension = ".pkl"
-    # (keep the atomic dump version only in your real file)
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
-        import os, tempfile
 
+    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
+        """Serialize `entry` to `path` atomically using pickle."""
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "wb", delete=False, dir=str(path.parent)
-            ) as tmp:
-                pickle.dump(entry, tmp)
-                tmp_name = tmp.name
-            os.replace(tmp_name, path)
+            _atomic_write(
+                path,
+                mode="wb",
+                write_fn=lambda tmp: pickle.dump(entry, tmp, protocol=pickle.HIGHEST_PROTOCOL),
+            )
         except Exception as exc:
-            try:
-                if "tmp_name" in locals():
-                    os.unlink(tmp_name)
-            except Exception:
-                pass
             log.error("Failed to write pickle %s: %s", path, exc)
 
     def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
+        """Load and return the pickled dict from `path`."""
         with path.open("rb") as f:
             return pickle.load(f)
 
 
+
 class JsonStorage(_BaseStorage):
+    """UTF-8 JSON storage with atomic writes and light normalization."""
     extension = ".json"
 
     def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
+        """Serialize `entry` to `path` atomically as JSON (utf-8)."""
         try:
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(
-                    entry,
-                    f,
-                    ensure_ascii=False,
-                    default=lambda o: o if json.dumps(o, default=str) else repr(o),
-                )
+            _atomic_write(
+                path,
+                mode="w",
+                open_kwargs={"encoding": "utf-8"},
+                write_fn=lambda tmp: json.dump(entry, tmp, ensure_ascii=False, default=_json_default),
+            )
         except Exception as exc:
             log.error("Failed to write json %s: %s", path, exc)
 
     def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
+        """
+        Load and return the JSON dict from `path`.
+
+        Normalization:
+        - Converts list-based "args" to tuple (if present),
+        - Replaces missing/None "kwargs" by {} for downstream stability.
+        """
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
+
+        # Normalize for downstream code expecting tuple args / dict kwargs
         if isinstance(data.get("args"), list):
-            data["args"] = tuple(data["args"])
+            try:
+                data["args"] = tuple(data["args"])
+            except Exception:
+                # Best-effort: keep as-is if conversion fails
+                pass
         if data.get("kwargs") is None:
             data["kwargs"] = {}
-        return data
 
+        return data
 
 class ReprStorage(_BaseStorage):
     extension = ".repr"
 
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
+    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # atomique
+        import os, tempfile
+        tmp_name = None
         try:
-            # 🔧 NEW: force a literal-friendly structure before pretty-printing
             lit = _to_literal(entry)
-            txt = pprint.pformat(lit, width=100, sort_dicts=False)
-            path.write_text(txt + "\n", encoding="utf-8")
+            txt = pprint.pformat(lit, width=100, sort_dicts=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as tmp:
+                tmp.write(txt + "\n")
+                tmp_name = tmp.name
+            os.replace(tmp_name, path)
         except Exception as exc:
+            try:
+                if tmp_name:
+                    os.unlink(tmp_name)
+            except Exception:
+                pass
             log.error("Failed to write repr %s: %s", path, exc)
 
-    def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
+    def load(self, path: Path) -> Dict[str, Any]:  # <-- RESTAURÉ
         txt = path.read_text(encoding="utf-8")
         data = ast.literal_eval(txt)
         return data
-
-
 _REGISTRY: Dict[str, StorageLike] = {
     "pickle": PickleStorage(),
     "json": JsonStorage(),
