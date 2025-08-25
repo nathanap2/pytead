@@ -127,7 +127,7 @@ def add_run_subparser(subparsers) -> None:
     # No hard-coded defaults: layered config fills missing values
     p.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS)
     p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS)
-    p.add_argument("--format", choices=["pickle", "json", "repr"], default=argparse.SUPPRESS)
+    p.add_argument("--format", choices=["pickle", "json", "repr", "graph-json"], default=argparse.SUPPRESS)
     p.add_argument(
         "--additional-sys-path",
         dest="additional_sys_path",

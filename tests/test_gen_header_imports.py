@@ -41,7 +41,12 @@ def _assert_passed(stdout: str, expected: int) -> None:
     ), f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
 
 
+
 def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
+    """
+    Vérifie que les tests générés (format legacy) peuvent importer du code
+    situé dans un répertoire additionnel spécifié via `import_roots`.
+    """
     root = tmp_path
 
     # Marque la racine pour le header (_find_root cherche .pytead/ ou pyproject.toml)
@@ -66,15 +71,26 @@ def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
     }
 
     # Génère un test avec import_roots = [".", "src"]
-    source = gen.render_tests(entries, import_roots=[".", "src"])
-    _w(root / "tests/generated/test_add.py", source)
+    # Cet appel est maintenant correct grâce à l'import en haut du fichier.
+    source = gen._render_legacy_tests(entries, import_roots=[".", "src"])
+    
+    # Crée le fichier de test généré
+    test_dir = root / "tests/generated"
+    test_dir.mkdir(parents=True)
+    _w(test_dir / "test_add.py", source)
 
+    # Lance pytest sur le répertoire racine du projet temporaire
     res = _run_pytest_in(root)
+    
+    # Vérifie que l'exécution de pytest a réussi
     if res.returncode != 0:
         raise AssertionError(
             f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         )
-    _assert_passed(res.stdout, expected=2)
+
+    # Vérification optionnelle mais recommandée : s'assurer que les tests ont bien tourné
+    assert "2 passed" in res.stdout
+
 
 
 def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkeypatch):
