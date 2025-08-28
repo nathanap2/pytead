@@ -2,7 +2,7 @@ import pytest
 from pathlib import Path
 
 from pytead.tracing import trace
-from pytead.storage import PickleStorage, JsonStorage, iter_entries
+from pytead.storage import PickleStorage, iter_entries, ReprStorage
 
 
 def count(dirpath: Path, pattern: str) -> int:
@@ -53,9 +53,9 @@ def test_limit_is_respected(tmp_path: Path):
         assert isinstance(e["args"], tuple)
         assert isinstance(e["kwargs"], dict)
 
-
-def test_json_storage_and_normalization(tmp_path: Path):
-    st = JsonStorage()
+def test_repr_storage_and_normalization_via_trace(tmp_path: Path):
+    """Vérifie le chemin complet trace->dump(.repr)->iter_entries et les normalisations."""
+    st = ReprStorage()
 
     @trace(limit=3, storage_dir=tmp_path, storage=st)
     def pair(a: int, b: int):
@@ -64,18 +64,18 @@ def test_json_storage_and_normalization(tmp_path: Path):
     pair(1, 2)
     pair(3, 4)
 
-    # Fichiers .json bien présents
-    assert count(tmp_path, "*.json") == 2
+    # Fichiers .repr bien présents
+    assert count(tmp_path, "*.repr") == 2
 
     # iter_entries normalise args -> tuple et kwargs -> dict
-    entries = list(iter_entries(tmp_path))
+    entries = list(iter_entries(tmp_path, formats=["repr"]))
     assert len(entries) == 2
     for e in entries:
         assert isinstance(e["args"], tuple)
         assert e["kwargs"] == {}
         assert "sum" in e["result"]
+        # la fonction renvoie déjà une liste ; on vérifie juste la structure attendue
         assert isinstance(e["result"]["lst"], list)
-
 
 def test_repr_storage_preserves_tuples(tmp_path: Path):
     from pytead.storage import ReprStorage, iter_entries

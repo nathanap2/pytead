@@ -51,7 +51,7 @@ def make_repo_with_toml(tmp_path: Path):
 
         [run]
         targets = [
-          "ioutils.render_json",
+          "ioutils.example",
           "world.BaseEntity.get_coordinates",
           "adjacent_mod.echo"
         ]
@@ -62,7 +62,7 @@ def make_repo_with_toml(tmp_path: Path):
     write(
         repo / "ioutils.py",
         """
-        def render_json(x):
+        def example(x):
             return {"x": x}
         """,
     )
@@ -112,10 +112,10 @@ def make_repo_with_yaml(tmp_path: Path):
         defaults:
           limit: 9
           storage_dir: "ylogs"
-          format: "json"
+          format: "repr"
         run:
           targets:
-            - ioutils.render_json
+            - ioutils.example
             - adjacent_mod.echo
           additional_sys_path:
             - ./logical_entities
@@ -125,7 +125,7 @@ def make_repo_with_yaml(tmp_path: Path):
     write(
         repo / "ioutils.py",
         """
-        def render_json(x):
+        def example(x):
             return {"x": x}
         """,
     )
@@ -211,8 +211,8 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
 
         # 1) Vérifications d’import réelles
         mod_iou = importlib.import_module("ioutils")
-        assert callable(getattr(mod_iou, "render_json", None))
-        assert mod_iou.render_json(3) == {"x": 3}
+        assert callable(getattr(mod_iou, "example", None))
+        assert mod_iou.example(3) == {"x": 3}
 
         mod_world = importlib.import_module("world")
         assert hasattr(mod_world, "BaseEntity")
@@ -231,7 +231,7 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
         # 3) Logs d’instrumentation
         log_text = "\n".join(r.message for r in caplog.records)
         assert "Instrumentation applied to 3 target(s)" in log_text
-        assert "ioutils.render_json" in log_text
+        assert "ioutils.example" in log_text
         assert "world.BaseEntity.get_coordinates" in log_text
         assert "adjacent_mod.echo" in log_text
     finally:
@@ -340,7 +340,7 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
 
         # Imports réels
         mod_iou = importlib.import_module("ioutils")
-        assert mod_iou.render_json(1) == {"x": 1}
+        assert mod_iou.example(1) == {"x": 1}
         mod_adj = importlib.import_module("adjacent_mod")
         assert mod_adj.echo("z") == "z"
 
@@ -353,6 +353,6 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
 
         # Logs (au moins une des cibles doit apparaître)
         log_text = "\n".join(r.message for r in caplog.records)
-        assert ("ioutils.render_json" in log_text) or ("adjacent_mod.echo" in log_text)
+        assert ("ioutils.example" in log_text) or ("adjacent_mod.echo" in log_text)
     finally:
         os.chdir(old_cwd)

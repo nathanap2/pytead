@@ -83,7 +83,7 @@ def add_gen_subparser(subparsers) -> None:
     grp.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS,
                      help="write one test module per function in this directory")
 
-    p.add_argument("--formats", choices=["pickle", "json", "repr", "graph-json"], nargs="*", default=argparse.SUPPRESS)
+    p.add_argument("--formats", choices=["pickle", "repr", "graph-json"], nargs="*", default=argparse.SUPPRESS)
     # optional: allow additional roots via config (mirrors run/tead)
     p.add_argument("--additional-sys-path", dest="additional_sys_path", nargs="*", default=argparse.SUPPRESS)
 

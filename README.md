@@ -6,13 +6,6 @@ I built Pytead to give LLMs and humans concrete usage examples of functions with
 
 ---
 
-## ✨ Features
-
-* **Runtime tracing** of a target function’s *real* calls (args, kwargs, return value, timestamp).
-* **Deterministic test generation** → parameterized **pytest** tests.
-
----
-
 ## 📦 Installation
 
 For now, install from your local clone:
@@ -21,13 +14,13 @@ For now, install from your local clone:
 git clone https://github.com/<you>/pytead
 cd pytead
 pip install -e .
-```
+````
 
 ---
 
 ## 🚀 Quickstart
 
-Say you have ...
+Say you have:
 
 ```python
 # mymodule.py
@@ -35,7 +28,7 @@ def multiply(a, b):
     return a * b
 ```
 
-... and you call it in ...
+…and you call it in:
 
 ```python
 # main.py
@@ -45,7 +38,7 @@ for (x, y) in [(2, 3), (2, 3), (10, 0)]:
     multiply(x, y)
 ```
 
-... let's use pytead on it :
+Use Pytead:
 
 ### 1) Trace real calls while running your app
 
@@ -53,7 +46,7 @@ for (x, y) in [(2, 3), (2, 3), (10, 0)]:
 pytead run mymodule.multiply -- main.py
 ```
 
-This launch your program as usual, but will write trace files while you're using it.
+This launches your script **as usual** and writes trace files as calls happen.
 
 ### 2) Generate pytest tests from traces
 
@@ -61,9 +54,9 @@ This launch your program as usual, but will write trace files while you're using
 pytead gen
 ```
 
-This writes tests like `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
+This writes tests such as `tests/generated/test_mymodule_multiply.py` using `@pytest.mark.parametrize`.
 
-You can run them later, after working on the code, to check your function still behave the same
+Then run:
 
 ```bash
 pytest -q
@@ -71,27 +64,28 @@ pytest -q
 
 ---
 
-## 🎛️ CLI reference (overview)
+## 🎛️ CLI overview
 
 ### `pytead run`
 
-Instrument one or more **module-level** functions and execute a Python script.
+Instrument one or more targets and execute a Python script.
 
 ```
-pytead run [options] <module.function> [...] -- <script.py> [script args...]
+pytead run [options] <module.function|module.Class.method> [...] -- <script.py> [script args...]
 ```
 
 **Common options**
 
-* `-l, --limit INT` — max calls to record per function
-* `-s, --storage-dir PATH` — where to write trace files (default: from config; packaged default: `call_logs/`)
-* `--format {pickle,json,repr}` — storage format
+* `-l, --limit INT` — max calls to record per function/method
+* `-s, --storage-dir PATH` — where to write trace files (default via config; packaged default: `call_logs/`)
+* `--format {pickle,repr,graph-json}` — storage format
+* `--additional-sys-path PATH...` — extra import roots (relative paths are anchored on the project root)
 
 **Notes**
 
-* Targets must be `package.module.function`. Class methods (`module.Class.method`) are not yet supported via the CLI (decorate at definition site or wrap at module level).
-* Only the **root** invocation of the traced function is recorded per call stack (thread-local depth control).
-* If you forget `--` and put `script.py` after targets, Pytead will do its best to split correctly.
+* Targets can be `package.module.function` **or** `package.module.Class.method`.
+* Only the **root** invocation per call stack is recorded (thread-local depth control).
+* If you forget `--`, Pytead tries to split args robustly anyway.
 
 ---
 
@@ -107,29 +101,39 @@ pytead gen [options]
 
 * `-c, --storage-dir PATH` — directory containing trace files
 * `-o, --output PATH` — write a single test module
-* `-d, --output-dir PATH` — write one test module **per function** into this directory
-* `--formats {pickle,json,repr}...` — restrict which formats to read
+* `-d, --output-dir PATH` — write **one test module per function** into this directory
+* `--formats {pickle,repr,graph-json}...` — restrict which formats to read
+* `--additional-sys-path PATH...` — extra import roots to embed in generated tests
 
 **Behavior**
 
 * Exact **duplicates** (same args/kwargs/result) are deduplicated.
-* Values are embedded using `repr(...)` in the generated code.
+* **State-based formats** inline values with `repr(...)`.
+* **Graph snapshots** are generated **one file per function** (with import bootstrap and dedicated assertions).
 
 ---
 
-### `pytead tead` (all-in-one)
-
-Trace **and** immediately generate tests in one go.
+### `pytead tead` (trace and generate in one go)
 
 ```
-pytead tead [options] <module.function> [...] -- <script.py> [script args...]
+pytead tead [options] <module.function|module.Class.method> [...] -- <script.py> [script args...]
 ```
 
 **Extras**
 
-* `--gen-formats {pickle,json,repr}...` — restrict formats when reading for generation
-* `--only-targets` — generate tests **only** for the functions targeted in this command
+* `--gen-formats {pickle,repr,graph-json}...`
+* `--only-targets` — only generate tests for the targets in this command
 * `-o/--output` or `-d/--output-dir` — same as `gen` (defaults to a single file if neither is provided)
+
+---
+
+### `pytead types` (experimental)
+
+Infer rough types from traces and emit `.pyi` stubs.
+
+```
+pytead types --calls-dir CALLS --out-dir TYPINGS [--formats ...]
+```
 
 ---
 
@@ -145,51 +149,37 @@ def multiply(a, b):
     return a * b
 ```
 
-Run your program normally; traces will be written the same way. Then:
+Run your program normally; traces are written the same way. Then:
 
 ```bash
 pytead gen
 ```
 
-### Custom storage example
+---
 
-```python
-from pathlib import Path
-import json, uuid
+## 🧠 Storage formats: when to use which?
 
-class MyJsonStorage:
-    extension = ".json"
+* **`repr`** (“state-based format”): great for pure-ish functions and simple objects; non-trivial objects are stringified in a stable, literal-friendly way.
+* **`graph-json`**: captures **nested object graphs** (attributes of attributes, cycles, shared references via `{"$ref": N}`), and generates **standalone-ish** tests:
 
-    def make_path(self, storage_dir: Path, func_fullname: str) -> Path:
-        storage_dir.mkdir(parents=True, exist_ok=True)
-        prefix = func_fullname.replace(".", "_")
-        return storage_dir / f"{prefix}__{uuid.uuid4().hex}{self.extension}"
-
-    def dump(self, entry: dict, path: Path) -> None:
-        path.write_text(json.dumps(entry, default=str), encoding="utf-8")
-
-    def load(self, path: Path) -> dict:
-        return json.loads(path.read_text(encoding="utf-8"))
-
-from pytead import trace
-
-@trace(storage_dir="call_logs", storage=MyJsonStorage())
-def f(x):
-    ...
-```
+  * Arguments/results are rehydrated **without calling** user constructors.
+  * If type annotations are missing, Pytead falls back to a lightweight **shell** (e.g., `SimpleNamespace`) so attribute access like `obj.a.m` still works.
+  * Designed for code that reads/writes object state; if nested methods must run with real behavior, prefer `pickle`.
+* **`pickle`**: exact Python object round-trips (least portable, currently more limited in this repo — to be revisited).
 
 ---
 
 ## ⚙️ Configuration
 
-### Where Pytead looks for config, and what is the priority order
+Pytead loads config in layers:
 
-Your config is in `./.pytead/config.toml` or `~/.config/pytead/config.toml` by default (you can change it with `$PYTEAD_CONFIG`).
+1. packaged defaults (`pytead/default_config.toml`)
+2. user-level config (`$XDG_CONFIG_HOME/pytead` or `~/.config/pytead`, etc.)
+3. nearest project config (`.pytead/config.{toml,yaml,yml}`)
 
-CLI flags > [section] for the command in your config > [defaults] section in your config > [section] in packaged fallback > [defaults] in packaged fallback
+Precedence: **CLI > command section > \[defaults]** (user & project) > **packaged**.
 
-
-### Example: project config (`.pytead/config.toml`)
+Example:
 
 ```toml
 [defaults]
@@ -212,34 +202,99 @@ only_targets = true
 
 ---
 
-## ⚠️ Limitations & caveats
+## 🧪 What generated tests look like
 
-* **Methods / attributes**: CLI targets `module.function` only (no `module.Class.method` yet).
-* **Side-effects & exceptions**: not captured in the current version. Tests assume pure behavior.
-* **Non-repr-able results**: generated code relies on `repr(...)`. Complex/custom objects may not round-trip.
-* **Flaky functions**: time/random-dependent functions may yield nondeterministic tests.
-* **Multiprocess tracing**: `limit` is best-effort (no cross-process locking).
+### State-based formats
+
+* One test module that:
+
+  * bootstraps imports (`testkit.setup`),
+  * holds a deduplicated list of cases,
+  * replays the call and **compares the result** (or, when applicable, object state).
+
+### Graph snapshots (`graph-json`)
+
+* **One test file per function** that:
+
+  * bootstraps import roots (project root + any additional paths),
+  * imports `assert_match_graph_snapshot` and `rehydrate_from_graph` from `pytead.testkit`,
+  * for each trace:
+
+    * **rehydrates** arguments (no `__init__` calls) and calls the function/method,
+    * compares the **data graph** of the result via `assert_match_graph_snapshot`.
+
+**Normalization in tests** (so they remain stable and valid Python):
+
+* **Tuples vs lists**: tuples are normalized to lists on both sides for comparisons (JSON encodes lists).
+* **NaN / ±Inf**: sanitized to `None` in generated code and in runtime comparisons.
+* **Aliasing**: captured as `{"$ref": N}`. For equality checks, the runtime side is “de-aliased” so structurally equal graphs compare equal even if the real object reused substructures.
+
 
 ---
 
-## 🗺️ Roadmap
+## 🔬 Advanced notes
 
-* Capture **exceptions** and generate `with pytest.raises(...)` cases.
+### Import bootstrapping & `sys.path.append`
+
+Generated tests insert **import roots** (script dir, detected project root, plus user-provided extra paths). This keeps tests importable even if the source used `sys.path.append(...)`.
+
+### Graph snapshot semantics
+
+* **Markers**:
+
+  * `{"$map": [[k_graph, v_graph], ...]}` for mappings with non-JSON keys,
+  * `{"$set": [...], "$frozen": bool}` for sets and frozensets,
+  * `{"$ref": N}` for shared references (aliasing).
+* In tests, `graph_to_data` rebuilds hashable keys (e.g., list keys → tuples, set keys → frozensets) and handles the markers consistently. Comparisons use a canonicalized view.
+
+### Rehydration (no-init) & shell fallback
+
+* `rehydrate_from_graph` builds instances **without calling** `__init__`, then assigns attributes.
+* When **type hints** exist, they guide deep rehydration (lists, dicts, sets, nested objects — also no-init).
+* When hints are missing, Pytead applies a **shell** fallback so `obj.a.m` is readable without real nested classes.
+
+### When to prefer `pickle`
+
+* If the tested code **calls methods** on nested objects and you want those methods to run with real behavior, `graph-json` (which shellifies innards) is not enough — use `pickle` or a future characterization mode.
+
+---
+
+## 🧭 Roadmap
+
+* Capture **exceptions** and generate `with pytest.raises(...)`.
 * Opt-in capture of **side-effects** (stdout, file I/O summaries, env changes).
-* CLI support for **`module.Class.method`** targets.
-* Pluggable **serialization** (e.g., jsonpickle) in the CLI.
-* Smarter **deduplication** and flaky-test detection (auto-run pytest and discard unstable cases).
-* **Doc enrichment**: promote real traces as runnable examples in docstrings/Markdown. 
+* Full CLI UX for `module.Class.method`.
+* Option to **preserve tuples** in graph snapshots.
+* Aliasing modes: “strict” (verify aliasing) vs “de-aliased” (current default).
+* **Characterization testing** mode for complex behavior.
+* Multiprocess tracing: cross-process quotas/locking.
+* Pluggable serialization (e.g., `jsonpickle`) via CLI.
+* Smarter dedup and flakiness detection (auto-run pytest and drop unstable cases).
 
 ---
 
 ## 🔗 Related tools & approaches
 
 * **Snapshot testing** (`pytest-snapshot`, `snapshottest`, `Syrupy`): great for outputs, but don’t harvest runtime **inputs**.
-* **Synthetic test generation** : Pynguin, for instance, explores inputs for coverage, but it's not based on your real executions.
-* **Automatic type inference** : Monkeytype use runtime to guess types (but we aim to make a more versatile tool oriented towards reading and subsequent modification of the code by agents) 
+* **Synthetic test generation**: Pynguin explores inputs for coverage but is not based on your real executions.
+* **Automatic type inference**: Monkeytype infers types from runtime; Pytead also focuses on tests and living docs.
 * **AOP / tracers** (`aspectlib`, `sys.settrace`): intercept calls but don’t emit ready-to-run pytest modules.
-* **Similar spirit**: **Keploy** (focus on external I/O) and various JS “record to unit test” tools.
+* Related spirit: **Keploy** (focus on external I/O) and various JS “record to unit test” tools.
+
+---
+
+## 📚 Glossary
+
+* **Trace / Entry**: one recorded call (fully-qualified target, args/kwargs, result, timestamp).
+* **State-based formats**: `repr`, `pickle` — parameterized tests driven by values/state snapshots.
+* **Graph snapshot (`graph-json`)**: deep data capture of object graphs (attributes), independent of concrete classes.
+* **Aliasing**: multiple paths pointing to the **same** object in memory; encoded as `{"$ref": N}`.
+* **De-alias (for comparison)**: expand/ignore alias markers to compare structures fairly.
+* **Shell fallback**: turn nested dict-like structures into lightweight attribute bags to allow `obj.attr` access without real classes.
+* **Rehydration (no-init)**: build instances without calling `__init__` and assign attributes.
+* **Import roots**: paths inserted into `sys.path` in generated tests so your modules import cleanly.
+* **Project root**: detected root (presence of `pyproject.toml` or `.pytead`).
+* **FQN** (Fully-Qualified Name): `package.module[.Class].function`.
 
 ---
 

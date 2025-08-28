@@ -10,15 +10,138 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
 import re
-from .graph_capture import capture_object_graph
+
+from .graph_capture import capture_object_graph, capture_object_graph_v2
 from .storage import PickleStorage, GraphJsonStorage, _to_literal as _to_literal
 
+
+class OrphanRefInTrace(RuntimeError):
+    """A {'$ref': N} appears in the trace but no matching {'$id': N} exists
+    in result/args/kwargs after best-effort fix. The trace must not be written.
+    """
 
 # Package-level logger stays quiet unless the host/CLI configures it.
 _pkg_logger = logging.getLogger("pytead")
 if not any(isinstance(h, logging.NullHandler) for h in _pkg_logger.handlers):
     _pkg_logger.addHandler(logging.NullHandler())
 _logger = logging.getLogger("pytead.tracing")
+
+
+
+
+
+
+
+
+
+
+# --- helpers pour inline depuis les donneurs (args/kwargs) ---
+def _build_ref_donor_index(donors_graphs):
+    """Collecte {id -> ancre_dict} sur tous les donneurs."""
+    index = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if "$id" in node and isinstance(node["$id"], int):
+                index[node["$id"]] = node
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                walk(v)
+
+    for g in donors_graphs:
+        walk(g)
+    return index
+
+
+def _inline_refs_from_donors(node, donor_index):
+    """Retourne une *copie* de node où chaque {'$ref': N} présent dans donor_index
+    est remplacé par une *copie profonde* de l'ancre correspondante.
+    """
+    if isinstance(node, dict):
+        # Cas feuille: uniquement {'$ref': N}
+        if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
+            rid = node["$ref"]
+            if rid in donor_index:
+                return copy.deepcopy(donor_index[rid])
+            return node  # pas de donneur connu -> on laisse tel quel
+        # Sinon on descend récursivement
+        return {k: _inline_refs_from_donors(v, donor_index) for k, v in node.items()}
+    elif isinstance(node, list):
+        return [_inline_refs_from_donors(x, donor_index) for x in node]
+    elif isinstance(node, tuple):
+        return tuple(_inline_refs_from_donors(x, donor_index) for x in node)
+    else:
+        return node
+
+
+def _validate_or_fix_graphjson_entry(entry, strict_mode="error"):
+    """Best-effort pour supprimer toute ref orpheline dans result_graph,
+    puis validation stricte. Renvoie *une copie* potentiellement corrigée.
+    strict_mode: "error" (défaut) | "warn"  (si tu veux dégrader en warning).
+    """
+    func = entry.get("func", "<unknown>")
+    args_g = entry.get("args_graph", [])
+    kwargs_g = entry.get("kwargs_graph", {})
+    result_g = entry.get("result_graph", None)
+
+    # 1) Tentative de correction : inliner les $ref qui pointent vers des ancres des donneurs
+    donor_index = _build_ref_donor_index([args_g, kwargs_g])
+    fixed_result = _inline_refs_from_donors(result_g, donor_index)
+
+    # 2) Validation : plus aucune ref orpheline en considérant args/kwargs comme donneurs
+    orphans = find_orphan_refs(fixed_result, donors_graphs=[args_g, kwargs_g])
+    if orphans:
+        msg = (
+            f"ORPHAN_REF in trace for {func}: {len(orphans)} orphan(s): "
+            + ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
+        )
+        if strict_mode == "warn":
+            log.warning(msg)
+        else:
+            # mode "error" par défaut
+            raise OrphanRefInTrace(msg)
+
+    # 3) Retourne une copie de l'entry avec result_graph corrigé
+    fixed = dict(entry)
+    fixed["result_graph"] = fixed_result
+    return fixed
+    
+def _build_graphjson_entry_unified(func_qualname, args, kwargs, result):
+    """
+    Capture v2 *en une passe* de (args, kwargs, result) pour que les IDs
+    soient *partagés* entre toutes les sections. Ça évite les $ref vers des
+    IDs qui n'existent que dans une autre passe de capture.
+    """
+    # On emballe pour capturer en une seule fois
+    bundle = {
+        "__args__": list(args),
+        "__kwargs__": dict(kwargs),
+        "__result__": result,
+    }
+    g = capture_object_graph(bundle, max_depth=5)  # même depth que le reste du projet
+
+    # On "dépaquette"
+    args_graph = g.get("__args__", [])
+    kwargs_graph = g.get("__kwargs__", {})
+    result_graph = g.get("__result__", None)
+
+    # Métadonnées + timestamp
+    entry = {
+        "trace_schema": "pytead/v2-graph",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "func": func_qualname,
+        "args_graph": args_graph,
+        "kwargs_graph": kwargs_graph,
+        "result_graph": result_graph,
+    }
+
+    # Garde-fou : par défaut, on exige l'absence de $ref orphelin
+    strict = os.getenv("PYTEAD_STRICT_GRAPH_JSON_REFS", "error").lower()
+    return _validate_or_fix_graphjson_entry(entry, strict_mode=strict)
+
+
 
 
 # ---------------------- Formatting helpers (unchanged behavior) ----------------------
@@ -444,374 +567,269 @@ def _emit_legacy_entry(
 
 # ---------------------- Public decorator (refactored) ----------------------
 
+# Thread-local pour éviter de capturer les appels imbriqués (seulement le "root" par pile)
+_tlocal = threading.local()
+
+
+def _now_iso() -> str:
+    try:
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    except Exception:
+        return str(time.time())
+
+
+def _depth_map() -> dict[int, int]:
+    d = getattr(_tlocal, "depth", None)
+    if d is None:
+        d = {}
+        _tlocal.depth = d
+    return d
+
+
+def _inc_depth(key: int) -> int:
+    d = _depth_map()
+    d[key] = d.get(key, 0) + 1
+    return d[key]
+
+
+def _dec_depth(key: int) -> int:
+    d = _depth_map()
+    cur = d.get(key, 0)
+    if cur <= 1:
+        d.pop(key, None)
+        return 0
+    d[key] = cur - 1
+    return d[key]
+
+
+def _fqn(func: Callable[..., Any]) -> str:
+    mod = getattr(func, "__module__", "<unknown>")
+    qn = getattr(func, "__qualname__", getattr(func, "__name__", "<?>"))
+    return f"{mod}.{qn}"
+
+
+def _make_entry_legacy(func_fqn: str, args: tuple, kwargs: dict, result: Any) -> dict:
+    return {
+        "trace_schema": "pytead/v1-state",
+        "timestamp": _now_iso(),
+        "func": func_fqn,
+        "args": args,
+        "kwargs": kwargs,
+        "result": result,
+    }
+
+
+def _maybe_capture_graph(x: Any, *, max_depth: int, strict: str):
+    # Local imports so the file header doesn't need to change if you don't use v2
+    from .graph_capture import capture_object_graph
+    if strict == "error":
+        from .graph_capture import capture_object_graph_checked
+        return capture_object_graph_checked(x, max_depth=max_depth)
+
+    g = capture_object_graph(x, max_depth=max_depth)
+
+    if strict == "warn":
+        try:
+            from .graph_utils import find_orphan_refs
+            orphans = find_orphan_refs(g)
+        except Exception:
+            orphans = []
+        if orphans:
+            try:
+                txt = ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
+            except Exception:
+                txt = "..."
+            _logger.warning("capture produced orphan $ref(s): %s", txt)
+    return g
+
+
+def _make_entry_graph(func_fqn: str, args: tuple, kwargs: dict, result: Any, *, max_depth: int, strict: str) -> dict:
+    """
+    Capture **v2** (avec $id/$ref) pour chaque racine **séparément**.
+    Important : on n'utilise PAS la projection v1 ici.
+    """
+    a_graph = [capture_object_graph_v2(a, max_depth=max_depth) for a in args]
+    k_graph = {k: capture_object_graph_v2(v, max_depth=max_depth) for (k, v) in kwargs.items()}
+    r_graph = capture_object_graph_v2(result, max_depth=max_depth)
+    return {
+        "trace_schema": "pytead/v2-graph",
+        "timestamp": _now_iso(),
+        "func": func_fqn,
+        "args_graph": a_graph,
+        "kwargs_graph": k_graph,
+        "result_graph": r_graph,
+    }
+
+
+
 def trace(
-    limit: int = 10,
-    storage_dir: Union[str, Path] = Path("call_logs"),
-    storage=None,
     *,
-    capture_objects: str = "off",
+    limit: int = 10,
+    storage_dir: str | Path = "call_logs",
+    storage: str | Any = "pickle",
+    # Paramètres capture v2 (pour .gjson)
+    max_depth: int = 5,
+    strict_graph: str = "off",  # "off" | "warn" | "error"
+    # Compat legacy (pickle/json/repr)
+    capture_objects: str = "simple",          # "off" | "simple"
     include_private_objects: bool = False,
-    objects_stringify_depth: int = 0,
-):
+    objects_stringify_depth: int = 1,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
-    Decorator that logs a callable's *root* calls so tests can be generated later.
+    Décorateur d’instrumentation.
 
-    Behavior
-    --------
-    - Per-thread depth tracking ensures only the outermost call is recorded.
-    - Pluggable Storage backend (pickle by default).
-    - Uses a lightweight, versioned schema header ("pytead/v1").
-
-    Instance methods
-    ----------------
-    - If the first parameter is named 'self', we:
-        * snapshot instance state (public + full/private variants) before/after,
-        * store it under entry["self"] = {
-              "type": str, "before": dict, "after": dict,
-              "state_before": dict, "state_after": dict
-          }
-        * apply a "bound first arg policy":
-            - For **Pickle** storage, drop the bound first arg (`self`/`cls`) from
-              stored `args` to avoid pickling local classes/instances.
-            - For **JSON/REPR** storages, replace the bound first arg with a **string
-              placeholder** (`repr(self_or_cls)`) so the entry remains literal-friendly.
-              At replay, tests can drop this placeholder (see pytead.rt.drop_self_placeholder).
-
-    Optional capture of simple objects (inputs/outputs)
-    ---------------------------------------------------
-        capture_objects: "off" | "simple"
-            - "off"   : current behavior (no extra capture for inputs/outputs)
-            - "simple": shallow snapshot of non-builtin objects in args/kwargs/result
-        include_private_objects: bool
-            - include private attributes (starting with '_') when snapshotting inputs/outputs
-        objects_stringify_depth: int
-            - 0 → canonical literal snapshot; ≥1 → stringify one level inside values
+    - Legacy storages (pickle/json/repr): enregistre
+        - args/kwargs/result
+        - bloc "self" pour les méthodes d'instance:
+            * before/after : attributs publics uniquement
+            * state_before/state_after : état complet (y compris privés)
+        - "obj_args" (spécifs d'objets non-builtin dans args/kwargs)
+        - "result_obj" si le résultat est un objet non-builtin
+    - Graph JSON ('.gjson'): enregistre l'IR v2 (args_graph/kwargs_graph/result_graph)
+      avec strict configurable.
     """
-    storage_path = Path(storage_dir)
-    st = storage or PickleStorage()
-    policy = _TracePolicy(
-        limit=limit,
-        storage_dir=storage_path,
-        storage=st,
-        capture_objects=capture_objects,
-        include_private_objects=include_private_objects,
-        objects_stringify_depth=objects_stringify_depth,
-    )
+    # Résolution du backend
+    if isinstance(storage, str):
+        from .storage import get_storage
+        st = get_storage(storage)
+    else:
+        st = storage
 
-    def _build_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
-        qual = getattr(fn, "__qualname__", getattr(fn, "__name__", "<lambda>"))
-        fullname = f"{fn.__module__}.{qual}"
-        prefix = fullname.replace(".", "_")
+    storage_dir = Path(storage_dir)
+    calls_done_by_func: dict[int, int] = {}
 
-        # Inspect parameters once
+    def decorator(obj: Callable[..., Any]) -> Callable[..., Any]:
+        # Détecter un descriptor staticmethod/classmethod et récupérer la vraie fonction
+        desc_kind: str | None = None
+        fn = obj
+        if isinstance(obj, staticmethod):
+            desc_kind = "staticmethod"
+            fn = obj.__func__  # type: ignore[attr-defined]
+        elif isinstance(obj, classmethod):
+            desc_kind = "classmethod"
+            fn = obj.__func__  # type: ignore[attr-defined]
+
+        func_key = id(fn)
+        func_fqn = _fqn(fn)
         try:
             sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            has_pos0 = len(params) >= 1 and params[0].kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-            first_name = params[0].name if has_pos0 else None
         except Exception:
-            has_pos0, first_name = False, None
-
-        # Policy
-        drop_first = has_pos0 and first_name in ("self", "cls")
-        snapshot_self = has_pos0 and first_name == "self"
-
-        # Depth control (per-thread)
-        local = threading.local()
-
-        # Per-decorated callable counter (avoid FS scans on each call)
-        counter_lock = threading.Lock()
-        initialized = False
-        written = 0
+            sig = None
 
         @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            prev_depth = getattr(local, "depth", 0)
-            setattr(local, "depth", prev_depth + 1)
-            is_root = prev_depth == 0
-
-            # BEFORE snapshots (public view + full view for rehydration)
-            self_type = None
-            pub_before = all_before = None
-            if is_root:
-                self_type, pub_before, all_before = _maybe_snapshot_self_before(args, snapshot_self)
-
+        def wrapper(*args, **kwargs):
+            depth = _inc_depth(func_key)
             try:
-                result = fn(*args, **kwargs)
+                # Décider si on trace ce call
+                should_trace = depth == 1 and calls_done_by_func.get(func_key, 0) < limit
+                is_graph = getattr(st, "extension", "") == ".gjson"
 
-                if is_root:
-                    # AFTER snapshots for self (if relevant)
-                    pub_after = all_after = None
-                    if pub_before is not None:
-                        pub_after, all_after = _snapshot_self_after(args, had_pub_before=True)
+                # --- PRE-SNAPSHOT pour legacy storages (besoin du "before") ---
+                # deux flags distincts :
+                # - snapshot_self : vrai uniquement pour méthodes d'instance
+                # - drop_first    : on retire le 1er arg de la persistence pour instance **ou** classmethod
+                snapshot_self = False
+                drop_first = False
+                self_type = None
+                pub_before = None
+                all_before = None
+                stored_args = args
+                obj_args_pos: Dict[int, dict] = {}
+                obj_args_kw: Dict[str, dict] = {}
+                policy = _TracePolicy(
+                    limit=limit,
+                    storage_dir=storage_dir,
+                    storage=st,
+                    capture_objects=capture_objects,
+                    include_private_objects=include_private_objects,
+                    objects_stringify_depth=objects_stringify_depth,
+                )
 
-                    nonlocal initialized, written
-                    with counter_lock:
-                        if not initialized:
-                            existing = list(policy.storage_dir.glob(f"{prefix}__*{st.extension}"))
-                            written = len(existing)
-                            initialized = True
+                if should_trace and not is_graph:
+                    # Heuristiques par signature + nature du descriptor
+                    try:
+                        params = list(sig.parameters.values()) if sig else []
+                        is_instance_method = bool(params) and params[0].name == "self" and len(args) >= 1
+                    except Exception:
+                        is_instance_method = len(args) >= 1
 
-                        if written < policy.limit:
-                            stored_args = _stored_args_for(st, drop_first, args)
-                            pos_map, kw_map = _build_obj_captures(args, kwargs, drop_first, policy)
-                            result_obj = _result_obj_spec_for(result, policy)
+                    is_class_method_call = (desc_kind == "classmethod" and len(args) >= 1)
 
-                            self_payload = None
-                            if pub_before is not None:
-                                self_payload = {
-                                    "type": self_type,
-                                    "before": pub_before,
-                                    "after": pub_after,
-                                    "state_before": all_before,
-                                    "state_after": all_after,
-                                }
+                    snapshot_self = is_instance_method
+                    drop_first = is_instance_method or is_class_method_call
 
-                            _emit_entry(
-                                st,
-                                policy.storage_dir,
-                                fullname,
-                                prefix,
-                                stored_args=stored_args,
-                                kwargs=kwargs,
-                                result=result,
-                                self_payload=self_payload,
-                                obj_args_pos=pos_map,
-                                obj_args_kw=kw_map,
-                                result_obj=result_obj,
-                            )
-                            written += 1
+                    # Snapshot 'self' avant appel (uniquement pour méthodes d'instance)
+                    self_type, pub_before, all_before = _maybe_snapshot_self_before(
+                        args, snapshot_self=snapshot_self
+                    )
 
-                return result
-            finally:
-                try:
-                    new_depth = getattr(local, "depth", 1) - 1
-                    if new_depth <= 0:
-                        if hasattr(local, "depth"):
-                            delattr(local, "depth")
+                    # Normalisation des args persistés (repr(self/cls) pour JSON/REPR, drop pour pickle)
+                    stored_args = _stored_args_for(st, drop_first, args)
+
+                    # Captures d'objets non-builtin dans args/kwargs (ignore aussi le 1er si drop_first)
+                    obj_args_pos, obj_args_kw = _build_obj_captures(args, kwargs, drop_first, policy)
+
+                # --- Appel utilisateur ---
+                res = fn(*args, **kwargs)
+
+                # --- Émission de l'entrée ---
+                if should_trace:
+                    n = calls_done_by_func.get(func_key, 0)
+                    if is_graph:
+                        entry = _make_entry_graph(
+                            func_fqn, args, kwargs, res,
+                            max_depth=max_depth, strict=strict_graph
+                        )
+                        path = st.make_path(storage_dir, func_fqn)
+                        st.dump(entry, path)
                     else:
-                        setattr(local, "depth", new_depth)
-                except Exception:
-                    # Cleanup must never crash the caller
-                    pass
+                        # Snapshot 'self' après appel (si instance method)
+                        pub_after, all_after = _snapshot_self_after(
+                            args, had_pub_before=(pub_before is not None)
+                        )
 
-        return cast(Callable[..., Any], wrapper)
+                        self_payload = None
+                        if snapshot_self and self_type is not None:
+                            # before/after = publics ; state_* = état complet (incl. privés)
+                            self_payload = {
+                                "type": self_type,
+                                "before": pub_before,
+                                "after": pub_after,
+                                "state_before": all_before if all_before is not None else pub_before,
+                                "state_after": all_after if all_after is not None else pub_after,
+                            }
+                            # on conserve aussi les miroirs internes
+                            if all_before is not None:
+                                self_payload["_all_before"] = all_before
+                            if all_after is not None:
+                                self_payload["_all_after"] = all_after
 
-    def decorator(func: Any) -> Any:
-        # If the user put @trace *outside* @staticmethod/@classmethod,
-        # handle descriptor objects by unwrapping/rewrapping.
-        if isinstance(func, staticmethod):
-            inner = func.__func__
-            return staticmethod(_build_wrapper(inner))
-        if isinstance(func, classmethod):
-            inner = func.__func__
-            return classmethod(_build_wrapper(inner))
-        # Normal function (module-level or defined in class body)
-        return _build_wrapper(func)
+                        result_obj = _result_obj_spec_for(res, policy)
+                        _emit_legacy_entry(
+                            st, storage_dir, func_fqn,
+                            stored_args=stored_args,
+                            kwargs=kwargs,
+                            result=res,
+                            self_payload=self_payload,
+                            obj_args_pos=obj_args_pos,
+                            obj_args_kw=obj_args_kw,
+                            result_obj=result_obj,
+                        )
+                    calls_done_by_func[func_key] = n + 1
+
+                return res
+            except BaseException:
+                raise
+            finally:
+                _dec_depth(func_key)
+
+        # Ré-appliquer le même type de descriptor si nécessaire
+        if desc_kind == "staticmethod":
+            return staticmethod(wrapper)  # type: ignore[return-value]
+        if desc_kind == "classmethod":
+            return classmethod(wrapper)   # type: ignore[return-value]
+        return wrapper
 
     return decorator
 
-def trace(
-    limit: int = 10,
-    storage_dir: Union[str, Path] = Path("call_logs"),
-    storage=None,
-    *,
-    capture_objects: str = "off",
-    include_private_objects: bool = False,
-    objects_stringify_depth: int = 0,
-):
-    """
-    Decorator that logs a callable's *root* calls so tests can be generated later.
-
-    The decorator operates in two main modes depending on the chosen storage format,
-    allowing for either state snapshotting or deep object graph capture.
-
-    ---
-    ### General Behavior (Applies to All Formats)
-    - **Pluggable Storage**: Behavior changes based on the storage backend 
-    (e.g., `pickle`, `json`, `graph-json`).
-    - **Root Call Tracing**: Per-thread depth tracking ensures only the 
-    outermost call in a call stack is recorded, avoiding noise from recursion.
-
-    ---
-    ### Mode 1: State Snapshot (formats: `pickle`, `json`, `repr`, `jsonpickle`)
-
-    This mode is designed for simple state capture or for creating perfect object 
-    reconstructions. The following parameters apply only to this mode.
-
-    **Instance Method Handling:**
-    - If the first parameter is named 'self' or 'cls', special handling is applied 
-    to capture the instance/class state without breaking serialization.
-    - The instance state is snapshotted before and after the call.
-    - The bound `self`/`cls` argument is either dropped (for `pickle`) or replaced
-    by a placeholder (for `json`/`repr`) to ensure portability.
-
-    **Parameters for Snapshot Mode:**
-    - `capture_objects: str = "off" | "simple"`
-    - `"off"`: Only captures primitive data.
-    - `"simple"`: Performs a shallow (depth=1) snapshot of non-builtin objects.
-    - `include_private_objects: bool`
-    - If `True`, includes attributes starting with `_` in the shallow snapshot.
-    - `objects_stringify_depth: int`
-    - `0`: Values in the snapshot are literals.
-    - `>0`: Values are stringified using `repr()`.
-
-    ---
-    ### Mode 2: Object Graph Capture (format: `graph-json`)
-
-    This mode is designed for deep, refactoring-resistant testing. It captures the
-    full data structure of objects in a class-agnostic way.
-
-    **Behavior:**
-    - **Deep Recursive Capture**: Recursively captures the attributes of all arguments
-    and the return value, creating a graph of dicts and lists.
-    - **Class-Agnostic**: The trace contains only data, not references to the
-    original classes. This makes tests highly resilient to code refactoring
-    (renaming or moving classes).
-    - **Reference Handling**: Shared objects and circular references are correctly
-    handled to produce a faithful representation of the object graph.
-    - **Simplified Parameters**: The parameters `capture_objects`, 
-    `include_private_objects`, etc., are ignored in this mode, as the capture
-    is always deep and opinionated.
-    """
-    storage_path = Path(storage_dir)
-    st = storage or PickleStorage()
-    policy = _TracePolicy(
-        limit=limit,
-        storage_dir=storage_path,
-        storage=st,
-        capture_objects=capture_objects,
-        include_private_objects=include_private_objects,
-        objects_stringify_depth=objects_stringify_depth,
-    )
-
-    def _build_wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
-        qual = getattr(fn, "__qualname__", getattr(fn, "__name__", "<lambda>"))
-        fullname = f"{fn.__module__}.{qual}"
-
-        # Inspect parameters once
-        try:
-            sig = inspect.signature(fn)
-            params = list(sig.parameters.values())
-            has_pos0 = len(params) >= 1 and params[0].kind in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            )
-            first_name = params[0].name if has_pos0 else None
-        except Exception:
-            has_pos0, first_name = False, None
-
-        # Policy
-        drop_first = has_pos0 and first_name in ("self", "cls")
-        snapshot_self = has_pos0 and first_name == "self"
-
-        # Depth control (per-thread)
-        local = threading.local()
-
-        # Per-decorated callable counter (avoid FS scans on each call)
-        counter_lock = threading.Lock()
-        initialized = False
-        written = 0
-
-        @functools.wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            prev_depth = getattr(local, "depth", 0)
-            setattr(local, "depth", prev_depth + 1)
-            is_root = prev_depth == 0
-
-            # BEFORE snapshots (for legacy formats)
-            self_type, pub_before, all_before = None, None, None
-            if is_root:
-                self_type, pub_before, all_before = _maybe_snapshot_self_before(args, snapshot_self)
-
-            try:
-                result = fn(*args, **kwargs)
-
-                if is_root:
-                    # AFTER snapshots (for legacy formats)
-                    pub_after, all_after = None, None
-                    if pub_before is not None:
-                        pub_after, all_after = _snapshot_self_after(args, had_pub_before=True)
-
-                    nonlocal initialized, written
-                    with counter_lock:
-                        if not initialized:
-                            existing = list(policy.storage_dir.glob(f"{fullname.replace('.', '_')}__*{st.extension}"))
-                            written = len(existing)
-                            initialized = True
-
-                        if written < policy.limit:
-                            # --- LOGIQUE DE BRANCHEMENT ---
-
-                            is_graph_format = isinstance(st, GraphJsonStorage)
-
-                            if is_graph_format:
-                                # --- BRANCHE A: Nouveau format "graph-json" ---
-                                args_graph = [capture_object_graph(arg) for arg in args]
-                                kwargs_graph = {k: capture_object_graph(v) for k, v in kwargs.items()}
-                                result_graph = capture_object_graph(result)
-                                entry = {
-                                    "trace_schema": "pytead/v1-graph",
-                                    "func": fullname,
-                                    "args_graph": args_graph,
-                                    "kwargs_graph": kwargs_graph,
-                                    "result_graph": result_graph,
-                                    "timestamp": datetime.utcnow().isoformat(timespec="microseconds") + "Z",
-                                }
-                                path = st.make_path(policy.storage_dir, fullname)
-                                st.dump(entry, path)
-
-
-                            else:
-                                # --- BRANCHE B: Formats existants ---
-                                stored_args = _stored_args_for(st, drop_first, args)
-                                pos_map, kw_map = _build_obj_captures(args, kwargs, drop_first, policy)
-                                result_obj = _result_obj_spec_for(result, policy)
-
-                                self_payload = None
-                                if pub_before is not None:
-                                    self_payload = {
-                                        "type": self_type, "before": pub_before, "after": pub_after,
-                                        "state_before": all_before, "state_after": all_after,
-                                    }
-                                
-                                _emit_legacy_entry(
-                                    st, policy.storage_dir, fullname,
-                                    stored_args=stored_args, kwargs=kwargs, result=result,
-                                    self_payload=self_payload, obj_args_pos=pos_map,
-                                    obj_args_kw=kw_map, result_obj=result_obj,
-                                )
-                            
-                            written += 1
-                
-                return result
-            finally:
-                try:
-                    new_depth = getattr(local, "depth", 1) - 1
-                    if new_depth <= 0:
-                        if hasattr(local, "depth"):
-                            delattr(local, "depth")
-                    else:
-                        setattr(local, "depth", new_depth)
-                except Exception:
-                    # Cleanup must never crash the caller
-                    pass
-
-        return cast(Callable[..., Any], wrapper)
-
-    def decorator(func: Any) -> Any:
-        # Gère les cas où @trace est appliqué sur @staticmethod/@classmethod
-        if isinstance(func, staticmethod):
-            inner = func.__func__
-            return staticmethod(_build_wrapper(inner))
-        if isinstance(func, classmethod):
-            inner = func.__func__
-            return classmethod(_build_wrapper(inner))
-        
-        # Fonction normale
-        return _build_wrapper(func)
-
-    return decorator

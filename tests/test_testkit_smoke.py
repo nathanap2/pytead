@@ -6,15 +6,19 @@ import textwrap
 import pytest
 
 from pytead.testkit import setup as tk_setup, run_case as tk_run, param_ids as tk_ids
-
+import uuid, sys, importlib
 
 def _write(p: Path, s: str) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(textwrap.dedent(s).strip() + "\n", encoding="utf-8")
 
 
+
 @pytest.fixture()
 def mymod(tmp_path: Path):
+    import sys, importlib, importlib.util, uuid
+
+    mod_name = f"mymod_{uuid.uuid4().hex[:8]}"
     code = """
     class Box:
         __slots__ = ("x",)
@@ -28,18 +32,35 @@ def mymod(tmp_path: Path):
         return a + b
 
     def transform(box, inc):
-        # mutate input, then return a NEW Box based on the updated value
         box.x += inc
         return Box(box.x * 2)
 
     def make_box(x):
         return Box(x)
     """
-    mod_path = tmp_path / "mymod.py"
+    mod_path = tmp_path / f"{mod_name}.py"
     _write(mod_path, code)
-    # Make tmp_path importable for the tests using the runtime setup hook
+
+    # Rendez le dépôt temporaire importable à l’exécution des tests
     tk_setup(__file__, [str(tmp_path)])
-    return "mymod"
+
+    # ⚙️ Import *par fichier* sous le nom `mod_name`, puis enregistrement dans sys.modules
+    if mod_name in sys.modules:
+        del sys.modules[mod_name]
+    importlib.invalidate_caches()
+
+    spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = module  # ← clé : lier le nom au module *avant* exec
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    # Sanity checks : on s’assure que le module contient bien les symboles attendus
+    assert hasattr(module, "Box") and hasattr(module, "add") and hasattr(module, "transform")
+
+    return mod_name
+
+
 
 def test_inject_object_args_on_kw_and_pos(mymod):
     from pytead.rt import inject_object_args, rehydrate

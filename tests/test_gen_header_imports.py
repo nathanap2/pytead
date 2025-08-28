@@ -8,6 +8,7 @@ import textwrap
 import re
 
 import pytead.gen_tests as gen
+from pytead.storage import ReprStorage  # NEW
 
 
 def _w(p: Path, s: str) -> Path:
@@ -36,10 +37,7 @@ def _assert_passed(stdout: str, expected: int) -> None:
     if not m:
         raise AssertionError(f"'passed' count not found in pytest output:\n{stdout}")
     got = int(m.group(1))
-    assert (
-        got == expected
-    ), f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
-
+    assert got == expected, f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
 
 
 def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
@@ -71,9 +69,8 @@ def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
     }
 
     # Génère un test avec import_roots = [".", "src"]
-    # Cet appel est maintenant correct grâce à l'import en haut du fichier.
     source = gen._render_legacy_tests(entries, import_roots=[".", "src"])
-    
+
     # Crée le fichier de test généré
     test_dir = root / "tests/generated"
     test_dir.mkdir(parents=True)
@@ -81,16 +78,15 @@ def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
 
     # Lance pytest sur le répertoire racine du projet temporaire
     res = _run_pytest_in(root)
-    
+
     # Vérifie que l'exécution de pytest a réussi
     if res.returncode != 0:
         raise AssertionError(
             f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         )
 
-    # Vérification optionnelle mais recommandée : s'assurer que les tests ont bien tourné
+    # Vérification : s'assurer que les tests ont bien tourné
     assert "2 passed" in res.stdout
-
 
 
 def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkeypatch):
@@ -121,32 +117,32 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
         """,
     )
 
-    # Traces JSON minimalistes dans calls_dir (2 cas attendus)
-    _w(
-        root / "calls/app_utils_mul__1.json",
-        """
+    # Traces REPR minimalistes dans calls_dir (2 cas attendus)
+    calls_dir = root / "calls"
+    calls_dir.mkdir(parents=True, exist_ok=True)
+
+    st = ReprStorage()
+    st.dump(
         {
-          "trace_schema": "pytead/v1",
-          "func": "app.utils.mul",
-          "args": [2, 3],
-          "kwargs": {},
-          "result": 6,
-          "timestamp": "2025-01-01T00:00:00Z"
-        }
-        """,
+            "trace_schema": "pytead/v1",
+            "func": "app.utils.mul",
+            "args": (2, 3),
+            "kwargs": {},
+            "result": 6,
+            "timestamp": "2025-01-01T00:00:00Z",
+        },
+        calls_dir / "app_utils_mul__1.repr",
     )
-    _w(
-        root / "calls/app_utils_mul__2.json",
-        """
+    st.dump(
         {
-          "trace_schema": "pytead/v1",
-          "func": "app.utils.mul",
-          "args": [10, 0],
-          "kwargs": {},
-          "result": 0,
-          "timestamp": "2025-01-01T00:00:01Z"
-        }
-        """,
+            "trace_schema": "pytead/v1",
+            "func": "app.utils.mul",
+            "args": (10, 0),
+            "kwargs": {},
+            "result": 0,
+            "timestamp": "2025-01-01T00:00:01Z",
+        },
+        calls_dir / "app_utils_mul__2.repr",
     )
 
     # Appelle le handler "gen" (CWD = racine du projet)
@@ -165,3 +161,4 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
             f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
         )
     _assert_passed(res.stdout, expected=2)
+

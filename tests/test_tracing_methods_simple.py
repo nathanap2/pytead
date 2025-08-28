@@ -3,7 +3,7 @@ from pathlib import Path
 import inspect
 
 from pytead.tracing import trace
-from pytead.storage import JsonStorage, iter_entries
+from pytead.storage import ReprStorage, iter_entries
 
 
 def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
@@ -15,9 +15,9 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     - instance method: wrap function and rebind on the class
     - staticmethod/classmethod: wrap underlying __func__, then rewrap
 
-    NOTE: use JsonStorage because local classes/instances aren't picklable.
+    NOTE: use ReprStorage because local classes/instances aren't picklable.
     """
-    st = JsonStorage()
+    st = ReprStorage()
 
     class Calc:
         @staticmethod
@@ -56,7 +56,7 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert Calc.tag("X") == "Calc:X"
 
     # --- Read back entries ---
-    entries = list(iter_entries(tmp_path, formats=["json"]))
+    entries = list(iter_entries(tmp_path, formats=["repr"]))
     names = sorted(e["func"] for e in entries)
 
     # Qualnames should include the class
@@ -64,7 +64,7 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert any(n.endswith(".Calc.smul") for n in names)
     assert any(n.endswith(".Calc.tag") for n in names)
 
-    # Sanity on args/results for each (JSON uses repr for non-JSONable objects)
+    # Sanity on args/results for each (repr uses string placeholders for non-literal objects)
     by = {e["func"]: e for e in entries}
 
     # add(self, 2, 3) — first arg is repr(self) as a str; tail are the numbers
@@ -82,3 +82,4 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert isinstance(by[k_tag]["args"][0], str) and "Calc" in by[k_tag]["args"][0]
     assert by[k_tag]["args"][1:] == ("X",)
     assert by[k_tag]["result"] == "Calc:X"
+

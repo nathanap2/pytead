@@ -61,8 +61,8 @@ def _finalize_io_paths(project_root: Path, calls_dir: Path | None, out_dir: Path
     if out_dir is None:
         cfg_out = eff_types.get("out_dir")
         out_dir = _as_path(cfg_out)
-    calls_dir = resolve_under(project_root, calls_dir) if calls_dir else None
-    out_dir = resolve_under(project_root, out_dir) if out_dir else None
+    calls_dir = _resolve_under(project_root, calls_dir) if calls_dir else None
+    out_dir = _resolve_under(project_root, out_dir) if out_dir else None
     return calls_dir, out_dir
 
 
@@ -169,7 +169,7 @@ def add_types_subparser(subparsers) -> None:
     )
     p.add_argument(
         "--formats",
-        choices=["pickle", "json", "repr"],
+        choices=["pickle", "repr"],
         nargs="*",
         default=argparse.SUPPRESS,
         help="restrict formats when reading traces",

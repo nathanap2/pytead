@@ -12,6 +12,7 @@ import importlib
 import inspect
 import typing
 import math
+import copy
 import sys
 import importlib.util
 from types import ModuleType
@@ -20,27 +21,119 @@ from contextlib import contextmanager
 
 from .storage import iter_entries
 from ._cases import unique_cases as unique_legacy_cases, render_case
+from .normalize import sanitize_for_py_literals, tuples_to_lists
+
+from .errors import GenerationError, OrphanRefInExpected
+from .graph_utils import project_v2_to_v1, find_orphan_refs, _build_ref_donor_index, _inline_external_refs_in_expected
+
 
 __all__ = ["collect_entries", "render_tests", "write_tests", "write_tests_per_func"]
 log = logging.getLogger("pytead.gen")
+
+
+
+
+
+def _collect_id_map_gen(node: Any, out: dict[int, Any]) -> None:
+    """Mappe chaque '$id' -> noeud porteur, pour expansion des '$ref'."""
+    if isinstance(node, dict):
+        if "$id" in node:
+            out[node["$id"]] = node
+        for v in node.values():
+            _collect_id_map_gen(v, out)
+    elif isinstance(node, list):
+        for x in node:
+            _collect_id_map_gen(x, out)
+
+def _strip_ids_gen(node: Any) -> Any:
+    """Supprime tous les '$id' récursivement (non sémantique pour la valeur)."""
+    if isinstance(node, dict):
+        return {k: _strip_ids_gen(v) for k, v in node.items() if k != "$id"}
+    if isinstance(node, list):
+        return [_strip_ids_gen(x) for x in node]
+    return node
+
+def _expand_refs_cycle_safe_gen(node: Any, idmap: dict[int, Any], stack: set[int]) -> Any:
+    """
+    Remplace {'$ref': N} par l'expansion profonde de idmap[N], mais
+    **protège les cycles** : si N est déjà en cours d'expansion, on garde {'$ref': N}.
+    On propage aussi l'$id courant dans la pile pour détecter les back-refs.
+    """
+    if isinstance(node, dict):
+        # Cas 'pur' ref
+        if set(node.keys()) == {"$ref"}:
+            ref = node["$ref"]
+            if ref in idmap and ref not in stack:
+                stack.add(ref)
+                # on strippe l'$id du target avant descente, sinon bruit inutile
+                expanded = _expand_refs_cycle_safe_gen(_strip_ids_gen(idmap[ref]), idmap, stack)
+                stack.remove(ref)
+                return expanded
+            return node  # inconnu ou cycle détecté
+
+        # Dict normal : si porte un $id, on le pousse dans la pile le temps de descendre
+        pushed = None
+        if "$id" in node:
+            pushed = node["$id"]
+            stack.add(pushed)
+
+        out = {k: _expand_refs_cycle_safe_gen(v, idmap, stack) for k, v in node.items()}
+
+        if pushed is not None:
+            stack.remove(pushed)
+        return out
+
+    if isinstance(node, list):
+        return [_expand_refs_cycle_safe_gen(x, idmap, stack) for x in node]
+
+    return node
+
+def _unwrap_local_list_refs_gen(node: Any) -> Any:
+    """
+    Heuristique: dans une liste, si un élément est {'$ref': N} et qu'on n'a
+    aucun idmap pertinent, on recopie l'élément précédent (pattern simple
+    vu dans certaines traces).
+    """
+    if isinstance(node, list):
+        out = []
+        for i, x in enumerate(node):
+            if isinstance(x, dict) and set(x.keys()) == {"$ref"} and i > 0:
+                out.append(out[-1])
+            else:
+                out.append(_unwrap_local_list_refs_gen(x))
+        return out
+    if isinstance(node, dict):
+        return {k: _unwrap_local_list_refs_gen(v) for k, v in node.items()}
+    return node
+
+def normalize_graph_for_generation(graph: Any) -> Any:
+    """
+    Pipeline génération:
+      1) NaN/Inf -> None
+      2) Construire idmap et *expand* les $ref (protégé contre les cycles)
+      3) Enlever tous les $id
+      4) Heuristique 'local list ref'
+      5) Tuples -> listes
+    Résultat: structure 'valeur' lisible et portable (sans $id/$ref quand acyclique).
+    """
+    g = sanitize_for_py_literals(graph)
+    idmap: dict[int, Any] = {}
+    _collect_id_map_gen(g, idmap)
+    if idmap:
+        g = _expand_refs_cycle_safe_gen(g, idmap, stack=set())
+    g = _strip_ids_gen(g)
+    g = _unwrap_local_list_refs_gen(g)
+    g = tuples_to_lists(g)
+    return g
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # Utilities for robust, refactoring-friendly test generation
 # ---------------------------------------------------------------------------
 
-def _sanitize_for_code(obj: Any) -> Any:
-    """Make data safe as a Python literal in generated source (NaN/Inf -> None)."""
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return obj
-    if isinstance(obj, (list, tuple)):
-        t = [_sanitize_for_code(x) for x in obj]
-        return tuple(t) if isinstance(obj, tuple) else t
-    if isinstance(obj, dict):
-        return {k: _sanitize_for_code(v) for k, v in obj.items()}
-    return obj
 
 
 def _split_owner_and_callable(func_fqn: str) -> tuple[str, Optional[str], str]:
@@ -174,6 +267,63 @@ def _resolve_callable_with_submodules(func_fqn: str) -> Tuple[Any, ModuleType | 
 
     raise ImportError(f"Could not resolve '{func_fqn}' after several attempts.")
 
+def _collect_ids_for_refcheck(node, out: set[int]) -> None:
+    """
+    Collect all integer `$id` anchors contained anywhere under `node`.
+    We traverse dicts, lists, and special shapes like {"$map": [...]}, {"$set": [...]}
+    without altering anything.
+    """
+    if node is None:
+        return
+    if isinstance(node, dict):
+        val = node.get("$id")
+        if isinstance(val, int):
+            out.add(val)
+        # special shapes
+        if isinstance(node.get("$map"), list):
+            for i, pair in enumerate(node["$map"]):
+                if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                    _collect_ids_for_refcheck(pair[0], out)
+                    _collect_ids_for_refcheck(pair[1], out)
+            return
+        if isinstance(node.get("$set"), list):
+            for e in node["$set"]:
+                _collect_ids_for_refcheck(e, out)
+            return
+        # generic dict
+        for v in node.values():
+            _collect_ids_for_refcheck(v, out)
+        return
+    if isinstance(node, list):
+        for x in node:
+            _collect_ids_for_refcheck(x, out)
+
+
+
+
+def _assert_no_orphan_refs_in_expected(expected_graph, donors_graphs, *, func_qualname: str = "") -> None:
+    """
+    Vérifie qu'il n'y a pas de {'$ref': N} orphelin dans expected_graph, en tenant compte
+    des ancres présentes dans donors_graphs (args/kwargs) ET dans expected_graph lui-même.
+    S'il y a des orphelins → OrphanRefInExpected (avec chemins JSONPath).
+    """
+    orphans = find_orphan_refs(expected_graph, donors_graphs)
+    if orphans:
+        try:
+            log.warning(
+                "ORPHAN_REF in expected snapshot for %s: %d orphan(s): %s",
+                func_qualname or "<unknown>",
+                len(orphans),
+                ", ".join(f"{p} -> ref={rid}" for p, rid in orphans),
+            )
+        except Exception:
+            pass
+        details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
+        raise OrphanRefInExpected(
+            "Unresolved {'$ref': N} in expected snapshot. "
+            f"Found {len(orphans)} orphan ref(s): {details}"
+        )
+
 
 def _get_param_info(func_fqn: str, is_method: bool | None = None) -> tuple[dict[str, Any], dict[str, set[str]]]:
     """
@@ -274,129 +424,77 @@ def _get_param_info(func_fqn: str, is_method: bool | None = None) -> tuple[dict[
     return param_class_map, imports_needed
 
 
-def render_graph_snapshot_test_body(
+
+
+    
+def compute_call_signature(
     func_name: str,
     entry: dict,
     param_types: dict[str, Any],
     owner_class: Optional[str] = None,
-) -> str:
+) -> tuple[list[str], str]:
     """
-    Render the source of a single pytest test function that performs a
-    graph-snapshot check for one recorded call.
-
-    Parameters
-    ----------
-    func_name : str
-        The short function/method name (without module/class).
-    entry : dict
-        A single trace entry with keys "args_graph", "kwargs_graph", "result_graph".
-    param_types : dict[str, Any]
-        Mapping from parameter name -> annotation type object (when importable).
-        Used to decide whether to rehydrate complex arguments into class instances.
-    owner_class : Optional[str]
-        If not None, indicates we are targeting a method of `owner_class` (string with class name
-        available in the same module import the caller emits).
-
-    Behavior
-    --------
-    - The graph snapshots (args/kwargs/result) are embedded as Python literals after a
-      sanitization pass that converts NaN/±Inf -> None for code-safety.
-    - Before calling the target, data graphs are *normalized* back to Python containers
-      using `graph_to_data(...)`. For arguments whose param annotation is a non-builtin
-      class, we also attempt rehydration using `rehydrate_from_graph(...)`.
-    - For methods:
-        * If args_graph[0] is present, it is assumed to be the `self` graph and is used
-          to build `self_instance`.
-        * If no `self` graph is available and the method has no args/kwargs, we fall back
-          to a tiny wrapper that constructs `owner_class()` with no arguments and invokes
-          the method. (This may fail if the constructor needs args, but it's a best-effort
-          fallback consistent with prior behavior.)
+    Construit (rehydrate_lines, call_line) pour le corps de test généré.
+    - rehydrate_lines: lignes de code (str) qui normalisent/rehydratent les args
+    - call_line: ligne qui effectue l'appel réel et stocke le résultat dans `real_result`
+    Ne dépend d'aucun état global (renvoie juste des chaînes prêtes à coller).
     """
-    import pprint, uuid
-
     args_graph = entry.get("args_graph", [])
     kwargs_graph = entry.get("kwargs_graph", {})
-    result_graph = entry.get("result_graph", None)
 
-    # Pretty-print sanitized graphs as valid Python literals in the generated file.
-    pretty_args = pprint.pformat(_sanitize_for_code(args_graph), indent=4, width=88, sort_dicts=True)
-    pretty_kwargs = pprint.pformat(_sanitize_for_code(kwargs_graph), indent=4, width=88, sort_dicts=True)
-    pretty_result = pprint.pformat(_sanitize_for_code(result_graph), indent=4, width=88, sort_dicts=True)
-
-    test_name = f"test_{func_name}_snapshot_{uuid.uuid4().hex[:8]}"
-
-    lines_rehydrate: List[str] = []
+    lines_rehydrate: list[str] = []
     owner_offset = 0
 
-    # --- Self handling for methods ----------------------------------------------------
+    # Cas méthode: si self capturé en args[0], on le rehydrate
     if owner_class:
-        if len(args_graph) >= 1:
-            # Rehydrate the instance from the first positional arg graph
+        if isinstance(args_graph, list) and len(args_graph) >= 1:
             lines_rehydrate.append(
                 f"    self_instance = rehydrate_from_graph(graph_to_data(args_graph[0]), {owner_class})"
             )
             owner_offset = 1
         else:
-            # No self captured. If there are no other args/kwargs, use a tiny wrapper
-            # that calls owner_class().method() with no params.
+            # Méthode sans self capturé et sans kwargs -> petit wrapper zéro-arg
             if not kwargs_graph:
                 wrapper = [
                     f"    def {func_name}():",
                     f"        return {owner_class}().{func_name}()",
                 ]
                 call_line = f"    real_result = {func_name}()"
-                lines = [
-                    f"def {test_name}():",
-                    "    # 1) Raw graphs embedded from the trace",
-                    f"    args_graph = {pretty_args}",
-                    f"    kwargs_graph = {pretty_kwargs}",
-                    f"    expected_graph = {pretty_result}",
-                    "",
-                    "    # 2) Zero-arg method wrapper (no `self` captured in trace)",
-                    *wrapper,
-                    "",
-                    "    # 3) Call",
-                    call_line,
-                    "",
-                    "    # 4) Compare snapshot",
-                    "    assert_match_graph_snapshot(real_result, expected_graph)",
-                ]
-                return "\n".join(lines)
+                return (wrapper, call_line)
 
-    # --- Argument rehydration / normalization ----------------------------------------
-    # Figure out how many *effective* positional args (excluding potential self)
+    # Nombre d'args positionnels hors self
+    effective_args = max(0, (len(args_graph) if isinstance(args_graph, list) else 0) - owner_offset)
+
+    # Noms de paramètres
     param_names = list(param_types.keys())
-    effective_args = max(0, len(args_graph) - owner_offset)
-    hydrated_names: List[str] = []
+    hydrated_names: list[str] = []
 
+    # Si la longueur colle exactement, on exploite les hints pour rehydrate_from_graph
     if param_names and len(param_names) == effective_args:
-        # We have names for all positional args → use annotations when available
         for i, name in enumerate(param_names):
             src_idx = i + owner_offset
             var = f"hydrated_arg_{i}"
             hydrated_names.append(var)
             cls = param_types.get(name)
             if isinstance(cls, type) and getattr(cls, "__module__", "") != "builtins":
-                # Complex type → normalize graph, then rehydrate into cls
                 lines_rehydrate.append(
                     f"    {var} = rehydrate_from_graph(graph_to_data(args_graph[{src_idx}]), {cls.__name__})"
                 )
             else:
-                # Simple or untyped arg → normalize only
                 lines_rehydrate.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
     else:
-        # Positional-only or no annotations → normalize every arg
+        # Fallback structurel: graph_to_data pour chaque arg
         for i in range(effective_args):
             src_idx = i + owner_offset
             var = f"hydrated_arg_{i}"
             hydrated_names.append(var)
             lines_rehydrate.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
 
-    # Always normalize kwargs graph before the call (handles $map/$set encodings).
+    # Kwargs: toujours normalisés
     if kwargs_graph:
         lines_rehydrate.append("    kwargs_graph = graph_to_data(kwargs_graph)")
 
-    # Build the call signature string
+    # Signature d'appel
     if hydrated_names and kwargs_graph:
         call_sig = f"{', '.join(hydrated_names)}, **kwargs_graph"
     elif hydrated_names:
@@ -406,23 +504,301 @@ def render_graph_snapshot_test_body(
     else:
         call_sig = ""
 
-    # Build the call line (method vs function)
+    # Ligne d'appel (méthode vs fonction)
+    call_line = (
+        f"    real_result = self_instance.{func_name}({call_sig})"
+        if owner_class
+        else
+        f"    real_result = {func_name}({call_sig})"
+    )
+
+    return lines_rehydrate or ["    pass"], call_line
+
+
+
+def _fmt_literal_for_embed(obj: Any) -> str:
+    """Pretty-prints a value with NaN/±Inf sanitized for safe embedding."""
+    return pprint.pformat(sanitize_for_py_literals(obj), indent=4, width=88, sort_dicts=True)
+
+
+
+
+
+def compute_expected_snapshot(entry: Dict[str, Any], *, func_qualname: str = "") -> Any:
+    """
+    Calcule l'expected snapshot à partir d'une trace v2.
+    - Si un $ref ne correspond à aucune ancre ($id) dans args/kwargs/result:
+      * log WARNING via 'pytead.gen' (message: "ORPHAN_REF remains after projection ...")
+      * lève OrphanRefInExpected
+    - Sinon, résout les refs et projette en forme v1-like.
+    """
+    from .errors import OrphanRefInExpected
+
+    log = logging.getLogger("pytead.gen")
+
+    # Fallback v1
+    if "result_graph" not in entry:
+        return entry.get("result")
+
+    result_graph = copy.deepcopy(entry.get("result_graph"))
+    args_graph = entry.get("args_graph") or []
+    kwargs_graph = entry.get("kwargs_graph") or {}
+
+    # (1) Collecte globale des ancres $id
+    anchor: Dict[int, Any] = {}
+
+    def _collect(node: Any) -> None:
+        if isinstance(node, dict):
+            rid = node.get("$id")
+            if isinstance(rid, int):
+                anchor[rid] = node
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                _collect(v)
+
+    if isinstance(args_graph, list):
+        for g in args_graph:
+            _collect(g)
+    if isinstance(kwargs_graph, dict):
+        for g in kwargs_graph.values():
+            _collect(g)
+    _collect(result_graph)
+
+    # (1bis) Pré-scan des refs pour détecter les orphelines (et logger comme attendu)
+    def _iter_refs(node: Any, path: str = "$"):
+        if isinstance(node, dict):
+            if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
+                yield (path, node["$ref"])
+            else:
+                for k, v in node.items():
+                    if k in ("$id", "$list"):
+                        continue
+                    child = f"{path}.{k}" if path != "$" else f"$.{k}"
+                    yield from _iter_refs(v, child)
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                yield from _iter_refs(v, f"{path}[{i}]")
+        elif isinstance(node, tuple):
+            for i, v in enumerate(node):
+                yield from _iter_refs(v, f"{path}[{i}]")
+
+    orphans = [(p, rid) for (p, rid) in _iter_refs(result_graph) if rid not in anchor]
+    if orphans:
+        # Log phrase exacte attendue par le test
+        try:
+            txt = ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
+            log.warning(
+                "ORPHAN_REF remains after projection for %s: %d orphan(s): %s",
+                func_qualname or "<unknown>", len(orphans), txt
+            )
+        except Exception:
+            pass
+        details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
+        raise OrphanRefInExpected(
+            "Unresolved {'$ref': N} in expected snapshot after projection. "
+            f"Found {len(orphans)} orphan ref(s): {details}"
+        )
+
+    # (2) Matérialisation v2→v1 (résolution des refs internes/croisées)
+    INPROGRESS = object()
+    memo: Dict[int, Any] = {}
+
+    def _resolve_ref_id(rid: int, path: str) -> Any:
+        if rid in memo:
+            val = memo[rid]
+            return {} if val is INPROGRESS else val
+        target = anchor.get(rid)
+        # target ne peut pas être None ici (pré-scan a filtré)
+        memo[rid] = INPROGRESS
+        val = _mat(target, path)
+        memo[rid] = val
+        return val
+
+    def _mat(node: Any, path: str = "$") -> Any:
+        if isinstance(node, dict):
+            if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
+                return _resolve_ref_id(node["$ref"], path)
+
+            if "$list" in node and isinstance(node["$list"], list):
+                return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node["$list"])]
+
+            out: Dict[str, Any] = {}
+            for k, v in node.items():
+                if k in ("$id", "$list"):
+                    continue
+                child = f"{path}.{k}" if path != "$" else f"$.{k}"
+                out[k] = _mat(v, child)
+            return out
+
+        if isinstance(node, list):
+            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
+
+        if isinstance(node, tuple):
+            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
+
+        if isinstance(node, float):
+            if math.isnan(node) or math.isinf(node):
+                return None
+            return node
+
+        return node
+
+    return _mat(result_graph, "$")
+
+
+def _plan_invocation_and_rehydration(
+    *,
+    func_name: str,
+    owner_class: Optional[str],
+    param_types: dict[str, Any],
+    args_graph: Any,
+    kwargs_graph: Any,
+) -> tuple[list[str], list[str], str, Optional[list[str]]]:
+    """
+    Retourne (owner_lines, rehydrate_lines, call_line, wrapper_block_or_None).
+    - owner_lines: ex. création de self_instance si method avec self capturé.
+    - rehydrate_lines: lignes 'hydrated_arg_i = ...' + normalisation kwargs.
+    - call_line: ligne d'appel réelle.
+    - wrapper_block_or_None: si method sans self et sans kwargs → petit wrapper.
+    """
+    owner_lines: list[str] = []
+    rehydrate_lines: list[str] = []
+    wrapper_block: Optional[list[str]] = None
+    owner_offset = 0
+
+    # --- owner / self ---------------------------------------------------------
+    if owner_class:
+        if isinstance(args_graph, list) and len(args_graph) >= 1:
+            owner_lines.append(
+                f"    self_instance = rehydrate_from_graph(graph_to_data(args_graph[0]), {owner_class})"
+            )
+            owner_offset = 1
+        else:
+            # Pas de self capturé et pas de kwargs → wrapper zéro-arg
+            if not kwargs_graph:
+                wrapper_block = [
+                    f"    def {func_name}():",
+                    f"        return {owner_class}().{func_name}()",
+                ]
+                call_line = f"    real_result = {func_name}()"
+                return owner_lines, rehydrate_lines, call_line, wrapper_block
+
+    # --- positional args ------------------------------------------------------
+    effective_args = max(0, (len(args_graph) if isinstance(args_graph, list) else 0) - owner_offset)
+    param_names = list(param_types.keys())
+    hydrated_names: list[str] = []
+
+    if param_names and len(param_names) == effective_args:
+        for i, name in enumerate(param_names):
+            src_idx = i + owner_offset
+            var = f"hydrated_arg_{i}"
+            hydrated_names.append(var)
+            cls = param_types.get(name)
+            if isinstance(cls, type) and getattr(cls, "__module__", "") != "builtins":
+                rehydrate_lines.append(
+                    f"    {var} = rehydrate_from_graph(graph_to_data(args_graph[{src_idx}]), {cls.__name__})"
+                )
+            else:
+                rehydrate_lines.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
+    else:
+        for i in range(effective_args):
+            src_idx = i + owner_offset
+            var = f"hydrated_arg_{i}"
+            hydrated_names.append(var)
+            rehydrate_lines.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
+
+    # --- kwargs ---------------------------------------------------------------
+    if kwargs_graph:
+        rehydrate_lines.append("    kwargs_graph = graph_to_data(kwargs_graph)")
+
+    # --- call signature & line ------------------------------------------------
+    if hydrated_names and kwargs_graph:
+        call_sig = f"{', '.join(hydrated_names)}, **kwargs_graph"
+    elif hydrated_names:
+        call_sig = ", ".join(hydrated_names)
+    elif kwargs_graph:
+        call_sig = "**kwargs_graph"
+    else:
+        call_sig = ""
+
     call_line = (
         f"    real_result = self_instance.{func_name}({call_sig})"
         if owner_class else
         f"    real_result = {func_name}({call_sig})"
     )
+    return owner_lines, rehydrate_lines, call_line, wrapper_block
 
-    # --- Assemble final test source ---------------------------------------------------
-    lines: List[str] = []
+
+# --- fonction principale (découpée) ------------------------------------------
+
+def render_graph_snapshot_test_body(
+    func_name: str,
+    entry: dict,
+    param_types: dict[str, Any],
+    owner_class: Optional[str] = None,
+) -> str:
+    """
+    Rend le corps d'un test snapshot (graph-json) pour un appel.
+    Découpée en 3 étapes testables : expected, plan d'invocation, embedding.
+    """
+    import uuid
+
+    args_graph = entry.get("args_graph", [])
+    kwargs_graph = entry.get("kwargs_graph", {})
+    result_graph = entry.get("result_graph", None)
+
+    # 1) expected prêt à embarquer (avec détection d’orphelines en entrée)
+    expected_graph = compute_expected_snapshot(entry, func_qualname=func_name)
+
+    # 2) Plan d’invocation & rehydration
+    owner_lines, rehydrate_lines, call_line, wrapper_block = _plan_invocation_and_rehydration(
+        func_name=func_name,
+        owner_class=owner_class,
+        param_types=param_types,
+        args_graph=args_graph,
+        kwargs_graph=kwargs_graph,
+    )
+
+    # 3) Embedding (littéraux jolis & assemblage)
+    pretty_args = _fmt_literal_for_embed(args_graph)
+    pretty_kwargs = _fmt_literal_for_embed(kwargs_graph)
+    pretty_result = _fmt_literal_for_embed(expected_graph)
+
+    test_name = f"test_{func_name}_snapshot_{uuid.uuid4().hex[:8]}"
+
+    if wrapper_block is not None:
+        # Cas spécial method sans self capturé (et sans kwargs) — wrapper zéro-arg
+        lines = [
+            f"def {test_name}():",
+            "    # 1) Raw graphs embedded (expected snapshot already inlined/sanitized)",
+            f"    args_graph = {pretty_args}",
+            f"    kwargs_graph = {pretty_kwargs}",
+            f"    expected_graph = {pretty_result}",
+            "",
+            "    # 2) Zero-arg method wrapper (no `self` captured in trace)",
+            *wrapper_block,
+            "",
+            "    # 3) Call",
+            call_line,
+            "",
+            "    # 4) Compare snapshot",
+            "    assert_match_graph_snapshot(real_result, expected_graph)",
+        ]
+        return "\n".join(lines)
+
+    # Chemin standard (fonction ou method avec self capturé / kwargs)
+    lines: list[str] = []
     lines.append(f"def {test_name}():")
-    lines.append("    # 1) Raw graphs embedded from the trace (sanitized: NaN/Inf -> None)")
+    lines.append("    # 1) Raw graphs embedded (expected snapshot already inlined/sanitized)")
     lines.append(f"    args_graph = {pretty_args}")
     lines.append(f"    kwargs_graph = {pretty_kwargs}")
     lines.append(f"    expected_graph = {pretty_result}")
     lines.append("")
     lines.append("    # 2) Normalize/rehydrate arguments")
-    lines.extend(lines_rehydrate or ["    pass"])
+    lines.extend(owner_lines or [])
+    lines.extend(rehydrate_lines or ["    pass"])
     lines.append("")
     lines.append("    # 3) Invoke the target")
     lines.append(call_line)

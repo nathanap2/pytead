@@ -1,7 +1,7 @@
 [defaults]
 limit = 10
 storage_dir = "call_logs"
-format = "pickle"
+format = "repr"
 
 [run]
 limit = 7

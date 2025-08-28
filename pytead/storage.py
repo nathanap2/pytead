@@ -11,6 +11,7 @@ from .typing_defs import StorageLike, TraceEntry
 
 from datetime import datetime
 from dataclasses import asdict
+from .errors import GraphJsonOrphanRef
 
 log = logging.getLogger("pytead.storage")
 
@@ -91,13 +92,6 @@ def _atomic_write(
             pass
         raise
 
-def _json_default(o: Any) -> Any:
-    try:
-        json.dumps(o)
-        return o
-    except Exception:
-        return repr(o)
-
 
 class _BaseStorage:
     extension = ""
@@ -131,45 +125,6 @@ class PickleStorage(_BaseStorage):
 
 
 
-class JsonStorage(_BaseStorage):
-    """UTF-8 JSON storage with atomic writes and light normalization."""
-    extension = ".json"
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # type: ignore[override]
-        """Serialize `entry` to `path` atomically as JSON (utf-8)."""
-        try:
-            _atomic_write(
-                path,
-                mode="w",
-                open_kwargs={"encoding": "utf-8"},
-                write_fn=lambda tmp: json.dump(entry, tmp, ensure_ascii=False, default=_json_default),
-            )
-        except Exception as exc:
-            log.error("Failed to write json %s: %s", path, exc)
-
-    def load(self, path: Path) -> Dict[str, Any]:  # type: ignore[override]
-        """
-        Load and return the JSON dict from `path`.
-
-        Normalization:
-        - Converts list-based "args" to tuple (if present),
-        - Replaces missing/None "kwargs" by {} for downstream stability.
-        """
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # Normalize for downstream code expecting tuple args / dict kwargs
-        if isinstance(data.get("args"), list):
-            try:
-                data["args"] = tuple(data["args"])
-            except Exception:
-                # Best-effort: keep as-is if conversion fails
-                pass
-        if data.get("kwargs") is None:
-            data["kwargs"] = {}
-
-        return data
-
 class ReprStorage(_BaseStorage):
     extension = ".repr"
 
@@ -196,110 +151,84 @@ class ReprStorage(_BaseStorage):
         txt = path.read_text(encoding="utf-8")
         data = ast.literal_eval(txt)
         return data
-        
-        
+
 class GraphJsonStorage(_BaseStorage):
     """
     Storage backend for the *graph-json* format.
-
-    Goals
-    -----
-    - Persist traces as JSON while keeping object *data graphs* fully serializable.
-    - Preserve the type of dictionary *keys* (ints, tuples, etc.) without
-      silently stringifying them: only `str` keys are stored as a native JSON
-      object; any non-`str` key switches the encoding to a stable `{"$map": ...}`
-      representation.
-    - Keep the on-disk shape deterministic (sorted when needed) to avoid noisy diffs.
-
-    Key design
-    ----------
-    * Dictionaries:
-        - If **all keys are `str`**, keep a regular JSON object: `{ "k": ... }`.
-        - Otherwise, encode as: `{ "$map": [[key_graph, value_graph], ...] }`
-          where each element is recursively processed. The `$map` list is sorted
-          by `repr(key_graph)` for deterministic ordering.
-    * Tuples are encoded as JSON lists (round-trips are handled by the testkit).
-    * Sets should already be normalized upstream; if they appear, they would need
-      a marker shape like `{"$set": [...], "$frozen": bool}` (handled elsewhere).
-    * We do **not** attempt to change NaN/Inf here (Python's `json` allows them);
-      the generator/testkit sanitize to `None` when embedding as Python literals.
-
-    Fallback
-    --------
-    If JSON serialization still fails (e.g. due to an exotic object sneaking in),
-    we fall back to a conservative strategy that **stringifies all dict keys**
-    recursively, so the write never aborts. This fallback is not expected under
-    normal operation because graphs are pre-normalized.
     """
 
-    extension = ".gjson"  # single suffix so Path(...).suffix == ".gjson"
+    extension = ".gjson"
 
     @staticmethod
     def _is_json_key_primitive(k: Any) -> bool:
-        """
-        Only `str` keys are allowed to stay as a plain JSON object.
-
-        Rationale: allowing numbers/bools as keys would *appear* to work in JSON
-        because Python would string-convert on dump/load, but that loses types.
-        By restricting to `str` here, we preserve non-string keys via `$map`.
-        """
         return isinstance(k, str)
 
     @classmethod
     def _make_json_key_safe(cls, obj: Any) -> Any:
-        """
-        Recursively transform `obj` so that *dictionary keys* are JSON-safe
-        without losing key types.
-
-        - Dict with all-`str` keys       -> keep a plain JSON object.
-        - Dict with any non-`str` key    -> encode as {"$map": [[k_graph, v_graph], ...]}.
-        - Lists/Tuples                   -> recurse into elements; tuples become lists.
-        - Everything else                -> returned as-is (already JSON-compatible or
-                                            expected to have been normalized upstream).
-        """
         if isinstance(obj, dict):
-            # All keys are str -> keep native JSON object, preserve keys exactly.
             if all(cls._is_json_key_primitive(k) for k in obj.keys()):
                 return {k: cls._make_json_key_safe(v) for k, v in obj.items()}
-
-            # Heterogeneous / non-string keys → encode as a list of pairs.
             items: list[list[Any]] = []
             for k, v in obj.items():
                 kg = cls._make_json_key_safe(k)
                 vg = cls._make_json_key_safe(v)
                 items.append([kg, vg])
-            # Deterministic order: sort by repr of the captured key graph.
             items.sort(key=lambda kv: repr(kv[0]))
             return {"$map": items}
-
         if isinstance(obj, list):
             return [cls._make_json_key_safe(x) for x in obj]
-
         if isinstance(obj, tuple):
-            # JSON doesn't have tuples; use a list.
             return [cls._make_json_key_safe(x) for x in obj]
-
-        # Sets (if any) should already be transformed by the capture layer.
-        # Scalars/strings/bools/None/etc. are fine as-is.
         return obj
+
+    # --- aides debug locales (pas d'import supplémentaire requis) ----------------
+    @staticmethod
+    def _count_ids_refs(node: Any) -> tuple[int, int]:
+        """Compte (#$id, #$ref) dans un graphe JSON-like (dict/list)."""
+        ids = refs = 0
+        def _walk(n: Any):
+            nonlocal ids, refs
+            if isinstance(n, dict):
+                if set(n.keys()) == {"$ref"} and isinstance(n.get("$ref"), int):
+                    refs += 1
+                    return
+                vid = n.get("$id")
+                if isinstance(vid, int):
+                    ids += 1
+                # $map / $set : descente spécifique
+                if isinstance(n.get("$map"), list):
+                    for pair in n["$map"]:
+                        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                            _walk(pair[0]); _walk(pair[1])
+                    # continuer vers autres clés tout de même
+                if isinstance(n.get("$set"), list):
+                    for e in n["$set"]:
+                        _walk(e)
+                for k, v in n.items():
+                    if k in {"$id", "$map", "$set"}:
+                        continue
+                    _walk(v)
+                return
+            if isinstance(n, list):
+                for x in n:
+                    _walk(x)
+        _walk(node)
+        return ids, refs
+
+    @staticmethod
+    def _fmt_counts(label: str, node: Any) -> str:
+        if node is None:
+            return f"{label}=(absent)"
+        i, r = GraphJsonStorage._count_ids_refs(node)
+        hint = " v1-like (no $id)" if i == 0 else ""
+        return f"{label}=(ids={i}, refs={r}{hint})"
 
     def dump(self, entry: Any, path: Path) -> None:
         """
-        Serialize `entry` to `path` atomically as UTF-8 JSON.
-
-        Accepts either:
-          - a dataclass instance (auto-converted with `asdict`), or
-          - a plain dict.
-
-        Adds:
-          - `trace_schema`: "pytead/v1-graph" (idempotent),
-          - `timestamp`   : ISO-8601 UTC with microseconds + 'Z'.
+        Serialize `entry` to JSON (UTF-8) atomically and enforce guardrails.
         """
-        from dataclasses import asdict
-        from datetime import datetime
-
         try:
-            # Normalize `entry` to a dict.
+            # Normalize input
             if hasattr(entry, "__dataclass_fields__"):
                 data = asdict(entry)
             elif isinstance(entry, dict):
@@ -308,28 +237,57 @@ class GraphJsonStorage(_BaseStorage):
                 log.warning("GraphJsonStorage.dump: unsupported entry type: %s", type(entry))
                 return
 
-            # Ensure schema/timestamp fields exist.
-            data.setdefault("trace_schema", "pytead/v1-graph")
+            # Metadata
+            data.setdefault("trace_schema", "pytead/v2-graph")
             data.setdefault("timestamp", datetime.utcnow().isoformat(timespec="microseconds") + "Z")
 
-            # Ensure dictionary keys are JSON-safe *without* losing types.
+            # -------- Guardrail: result_graph must be locally self-anchored --------
+            rg = data.get("result_graph", None)
+            if rg is not None:
+                from .graph_utils import find_local_orphan_refs
+                orphans = find_local_orphan_refs(rg)
+                if orphans:
+                    # Quick log for human scan
+                    try:
+                        log.warning(
+                            "GraphJsonStorage guardrail: orphan ref(s) in result_graph: %s",
+                            ", ".join(f"{p} -> ref={rid}" for (p, rid) in orphans),
+                        )
+                    except Exception:
+                        pass
+
+                    # Diagnostic résumé: comptes sur donneurs & résultat
+                    args_g = data.get("args_graph")
+                    kwargs_g = data.get("kwargs_graph")
+                    diag = " | ".join([
+                        self._fmt_counts("args", args_g),
+                        self._fmt_counts("kwargs", kwargs_g),
+                        self._fmt_counts("result", rg),
+                    ])
+
+                    # Message détaillé (format stable: 'path=… ref=N')
+                    enriched = "; ".join(f"path={p} ref={rid}" for (p, rid) in orphans)
+                    func_name = data.get("func") or "<unknown>"
+                    raise GraphJsonOrphanRef(
+                        f"graph-json guardrail: orphan $ref in result_graph: {enriched} "
+                        f"(func={func_name}; {diag})"
+                    )
+
+            # JSON-safe dict keys without losing key types
             safe = self._make_json_key_safe(data)
 
             _atomic_write(
                 path,
                 mode="w",
                 open_kwargs={"encoding": "utf-8"},
-                write_fn=lambda tmp: json.dump(
-                    safe, tmp, ensure_ascii=False, indent=2
-                ),
+                write_fn=lambda tmp: json.dump(safe, tmp, ensure_ascii=False, indent=2),
             )
 
         except TypeError as exc:
-            # Ultra-conservative fallback: stringify *all* dict keys everywhere.
-            # This should be rare; it trades type fidelity for guaranteed write.
+            # Fallback: stringify all dict keys
             log.error(
-                "GraphJsonStorage.dump: JSON serialization failed (%s). "
-                "Falling back to stringified keys.", exc
+                "GraphJsonStorage.dump: JSON serialization failed (%s). Falling back to stringified keys.",
+                exc,
             )
 
             def _force_str_keys(o: Any) -> Any:
@@ -348,13 +306,6 @@ class GraphJsonStorage(_BaseStorage):
             )
 
     def load(self, path: Path) -> Dict[str, Any]:
-        """
-        Load and return the JSON dict from `path` (UTF-8).
-
-        Note:
-        - The structure may contain the `$map` encoding for non-string dict keys.
-          The testkit provides `graph_to_data(...)` to convert it back when needed.
-        """
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
 
@@ -364,7 +315,6 @@ class GraphJsonStorage(_BaseStorage):
             
 _REGISTRY: Dict[str, StorageLike] = {
     "pickle": PickleStorage(),
-    "json": JsonStorage(),
     "repr": ReprStorage(),
     "graph-json": GraphJsonStorage(),
 }

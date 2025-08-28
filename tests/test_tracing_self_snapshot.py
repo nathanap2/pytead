@@ -6,7 +6,7 @@ from typing import Type
 import pytest
 
 from pytead.tracing import trace
-from pytead.storage import PickleStorage, JsonStorage, ReprStorage, iter_entries
+from pytead.storage import PickleStorage, ReprStorage, iter_entries
 
 
 # --- Helpers ---
@@ -27,7 +27,7 @@ def _load_entries_normed(dirpath: Path, storage) -> list[dict]:
     return list(iter_entries(dirpath, formats=[_format_for_storage(storage)]))
 
 
-@pytest.mark.parametrize("StorageCls", [PickleStorage, JsonStorage, ReprStorage])
+@pytest.mark.parametrize("StorageCls", [PickleStorage, ReprStorage])
 def test_function_tracing_basic(tmp_path: Path, StorageCls: Type):
     """Plain function: no 'self' snapshot; args/kwargs/result recorded; limit enforced."""
     storage = StorageCls()
@@ -54,7 +54,7 @@ def test_function_tracing_basic(tmp_path: Path, StorageCls: Type):
     assert got == {((1,), 2, 3), ((10,), -1, 9)}
 
 
-@pytest.mark.parametrize("StorageCls", [PickleStorage, JsonStorage, ReprStorage])
+@pytest.mark.parametrize("StorageCls", [PickleStorage, ReprStorage])
 def test_instance_method_self_before_after(tmp_path: Path, StorageCls: Type):
     storage = StorageCls()
 
@@ -92,7 +92,7 @@ def test_instance_method_self_before_after(tmp_path: Path, StorageCls: Type):
     assert s["state_after"].get("_secret") == 42
 
 
-@pytest.mark.parametrize("StorageCls", [PickleStorage, JsonStorage, ReprStorage])
+@pytest.mark.parametrize("StorageCls", [PickleStorage, ReprStorage])
 def test_static_and_class_methods_do_not_capture_self(tmp_path: Path, StorageCls: Type):
     storage = StorageCls()
 
@@ -117,7 +117,7 @@ def test_static_and_class_methods_do_not_capture_self(tmp_path: Path, StorageCls
         assert e["func"].endswith((".twice", ".name"))
 
 
-@pytest.mark.parametrize("StorageCls", [PickleStorage, JsonStorage, ReprStorage])
+@pytest.mark.parametrize("StorageCls", [PickleStorage, ReprStorage])
 def test_limit_is_respected(tmp_path: Path, StorageCls: Type):
     storage = StorageCls()
 
@@ -132,7 +132,7 @@ def test_limit_is_respected(tmp_path: Path, StorageCls: Type):
     assert len(entries) == 2  # capped by limit
 
 
-@pytest.mark.parametrize("StorageCls", [PickleStorage, JsonStorage, ReprStorage])
+@pytest.mark.parametrize("StorageCls", [PickleStorage, ReprStorage])
 def test_slots_are_snapshotted_and_callables_excluded(tmp_path: Path, StorageCls: Type):
     storage = StorageCls()
 
@@ -165,13 +165,14 @@ def test_slots_are_snapshotted_and_callables_excluded(tmp_path: Path, StorageCls
     assert "fn" not in before and "fn" not in after
 
 
-@pytest.mark.parametrize("StorageCls", [JsonStorage, ReprStorage])
-def test_json_and_repr_roundtrip_with_self(tmp_path: Path, StorageCls: Type):
+def test_repr_roundtrip_with_self(tmp_path):
     """
-    Pour JSON/REPR, on vérifie la structure *brute* écrite/relue par le backend,
-    donc on garde storage.load(...) dans ce test.
+    Vérifie la structure *brute* écrite/relue par le backend REPR via storage.load(...).
     """
-    storage = StorageCls()
+    from pytead.tracing import trace
+    from pytead.storage import ReprStorage
+
+    storage = ReprStorage()
 
     class Box:
         def __init__(self, items):
@@ -189,7 +190,9 @@ def test_json_and_repr_roundtrip_with_self(tmp_path: Path, StorageCls: Type):
     assert files, f"No trace file with extension {storage.extension}"
 
     e = storage.load(files[0])
+    # Les états 'before/after' existent et contiennent 'items' sous forme de séquence
     assert isinstance(e["self"]["before"]["items"], (list, tuple))
     assert isinstance(e["self"]["after"]["items"], (list, tuple))
     assert e["self"]["before"]["items"] == [1, 2]
     assert e["self"]["after"]["items"] == [1, 2, 3, 4]
+
