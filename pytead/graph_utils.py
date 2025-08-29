@@ -8,11 +8,13 @@ __all__ = [
     "find_orphan_refs",
     "find_local_orphan_refs",
     "find_id_paths",
-    "validate_graph"
+    "validate_graph",
+    "inline_and_project_expected"
     ]
 
 
 import logging
+from .normalize import sanitize_for_py_literals
 
 _log_gc = logging.getLogger("pytead.graph_capture")
 
@@ -380,3 +382,54 @@ def find_local_orphan_refs(graph: Any) -> List[Tuple[str, int]]:
     
     
 
+def inline_and_project_expected(
+    entry: dict,
+    *,
+    func_qualname: str = "",
+    tuples_as_lists: bool = True,
+) -> Any:
+    """
+    Construire l'expected 'lisible' à partir d'une trace v2 :
+      1) Inline des {'$ref': N} *externes* (via ancres dans args/kwargs),
+      2) Vérifie les refs orphelines (compte tenu des donneurs),
+      3) Projette v2→v1 (strip $id; tuples→listes si demandé),
+      4) Sanitize NaN/±Inf → None.
+    Le wording des logs/erreurs est préservé (compat tests).
+    """
+    log = logging.getLogger("pytead.gen")
+
+    # Cas legacy (pas de graphe résultat) : renvoie la valeur normalisée telle quelle
+    if "result_graph" not in entry or entry.get("result_graph") is None:
+        return sanitize_for_py_literals(entry.get("result"))
+
+    args_graph = entry.get("args_graph") or []
+    kwargs_graph = entry.get("kwargs_graph") or {}
+    result_graph = entry.get("result_graph")
+
+    # (1) Inline des refs externes à expected grâce aux ancres des donneurs
+    donor_index = _build_ref_donor_index([args_graph, kwargs_graph])
+    inlined = _inline_external_refs_in_expected(result_graph, donor_index)
+
+    # (2) Orphelines après inlining (donneurs = args/kwargs; expected compte aussi)
+    orphans = find_orphan_refs(inlined, donors_graphs=[args_graph, kwargs_graph])
+    if orphans:
+        try:
+            txt = ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
+            log.warning(
+                "ORPHAN_REF remains after projection for %s: %d orphan(s): %s",
+                func_qualname or "<unknown>", len(orphans), txt
+            )
+        except Exception:
+            pass
+        from .errors import OrphanRefInExpected  # import local pour éviter les cycles
+        details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
+        raise OrphanRefInExpected(
+            "Unresolved {'$ref': N} in expected snapshot after projection. "
+            f"Found {len(orphans)} orphan ref(s): {details}"
+        )
+
+    # (3) Projection v2→v1 (strip $id; tuples→listes selon option)
+    projected = project_v2_to_v1(inlined, mode="expected", tuples_as_lists=tuples_as_lists)
+
+    # (4) Normalisation littéraux Python
+    return sanitize_for_py_literals(projected)

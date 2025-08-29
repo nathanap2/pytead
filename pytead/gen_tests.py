@@ -24,8 +24,10 @@ from .storage import iter_entries
 from .normalize import sanitize_for_py_literals, tuples_to_lists
 
 from .errors import GenerationError, OrphanRefInExpected
-from .graph_utils import find_orphan_refs
+from .graph_utils import find_orphan_refs, inline_and_project_expected, project_v2_to_v1
 from ._cases import unique_cases, render_case, case_id
+
+
 
 __all__ = ["collect_entries", "render_tests", "write_tests", "write_tests_per_func"]
 log = logging.getLogger("pytead.gen")
@@ -173,25 +175,14 @@ def _unwrap_local_list_refs_gen(node: Any) -> Any:
         return {k: _unwrap_local_list_refs_gen(v) for k, v in node.items()}
     return node
 
+
 def normalize_graph_for_generation(graph: Any) -> Any:
     """
-    Pipeline génération:
-      1) NaN/Inf -> None
-      2) Construire idmap et *expand* les $ref (protégé contre les cycles)
-      3) Enlever tous les $id
-      4) Heuristique 'local list ref'
-      5) Tuples -> listes
-    Résultat: structure 'valeur' lisible et portable (sans $id/$ref quand acyclique).
+    Shim fin : sanitise et projette v2→v1 avec tuples→listes.
+    (Toute la logique d'inlining/refs vit dans graph_utils.)
     """
-    g = sanitize_for_py_literals(graph)
-    idmap: dict[int, Any] = {}
-    _collect_id_map_gen(g, idmap)
-    if idmap:
-        g = _expand_refs_cycle_safe_gen(g, idmap, stack=set())
-    g = _strip_ids_gen(g)
-    g = _unwrap_local_list_refs_gen(g)
-    g = tuples_to_lists(g)
-    return g
+    return tuples_to_lists(project_v2_to_v1(sanitize_for_py_literals(graph), mode="expected", tuples_as_lists=True))
+
 
 
 
@@ -502,130 +493,9 @@ def _fmt_literal_for_embed(obj: Any) -> str:
 
 
 
-
 def compute_expected_snapshot(entry: Dict[str, Any], *, func_qualname: str = "") -> Any:
-    """
-    Calcule l'expected snapshot à partir d'une trace v2.
-    - Si un $ref ne correspond à aucune ancre ($id) dans args/kwargs/result:
-      * log WARNING via 'pytead.gen' (message: "ORPHAN_REF remains after projection ...")
-      * lève OrphanRefInExpected
-    - Sinon, résout les refs et projette en forme v1-like.
-    """
-    from .errors import OrphanRefInExpected
-
-    log = logging.getLogger("pytead.gen")
-
-    # Fallback v1
-    if "result_graph" not in entry:
-        return entry.get("result")
-
-    result_graph = copy.deepcopy(entry.get("result_graph"))
-    args_graph = entry.get("args_graph") or []
-    kwargs_graph = entry.get("kwargs_graph") or {}
-
-    # (1) Collecte globale des ancres $id
-    anchor: Dict[int, Any] = {}
-
-    def _collect(node: Any) -> None:
-        if isinstance(node, dict):
-            rid = node.get("$id")
-            if isinstance(rid, int):
-                anchor[rid] = node
-            for v in node.values():
-                _collect(v)
-        elif isinstance(node, (list, tuple)):
-            for v in node:
-                _collect(v)
-
-    if isinstance(args_graph, list):
-        for g in args_graph:
-            _collect(g)
-    if isinstance(kwargs_graph, dict):
-        for g in kwargs_graph.values():
-            _collect(g)
-    _collect(result_graph)
-
-    # (1bis) Pré-scan des refs pour détecter les orphelines (et logger comme attendu)
-    def _iter_refs(node: Any, path: str = "$"):
-        if isinstance(node, dict):
-            if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
-                yield (path, node["$ref"])
-            else:
-                for k, v in node.items():
-                    if k in ("$id", "$list"):
-                        continue
-                    child = f"{path}.{k}" if path != "$" else f"$.{k}"
-                    yield from _iter_refs(v, child)
-        elif isinstance(node, list):
-            for i, v in enumerate(node):
-                yield from _iter_refs(v, f"{path}[{i}]")
-        elif isinstance(node, tuple):
-            for i, v in enumerate(node):
-                yield from _iter_refs(v, f"{path}[{i}]")
-
-    orphans = [(p, rid) for (p, rid) in _iter_refs(result_graph) if rid not in anchor]
-    if orphans:
-        # Log phrase exacte attendue par le test
-        try:
-            txt = ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
-            log.warning(
-                "ORPHAN_REF remains after projection for %s: %d orphan(s): %s",
-                func_qualname or "<unknown>", len(orphans), txt
-            )
-        except Exception:
-            pass
-        details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
-        raise OrphanRefInExpected(
-            "Unresolved {'$ref': N} in expected snapshot after projection. "
-            f"Found {len(orphans)} orphan ref(s): {details}"
-        )
-
-    # (2) Matérialisation v2→v1 (résolution des refs internes/croisées)
-    INPROGRESS = object()
-    memo: Dict[int, Any] = {}
-
-    def _resolve_ref_id(rid: int, path: str) -> Any:
-        if rid in memo:
-            val = memo[rid]
-            return {} if val is INPROGRESS else val
-        target = anchor.get(rid)
-        # target ne peut pas être None ici (pré-scan a filtré)
-        memo[rid] = INPROGRESS
-        val = _mat(target, path)
-        memo[rid] = val
-        return val
-
-    def _mat(node: Any, path: str = "$") -> Any:
-        if isinstance(node, dict):
-            if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
-                return _resolve_ref_id(node["$ref"], path)
-
-            if "$list" in node and isinstance(node["$list"], list):
-                return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node["$list"])]
-
-            out: Dict[str, Any] = {}
-            for k, v in node.items():
-                if k in ("$id", "$list"):
-                    continue
-                child = f"{path}.{k}" if path != "$" else f"$.{k}"
-                out[k] = _mat(v, child)
-            return out
-
-        if isinstance(node, list):
-            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
-
-        if isinstance(node, tuple):
-            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
-
-        if isinstance(node, float):
-            if math.isnan(node) or math.isinf(node):
-                return None
-            return node
-
-        return node
-
-    return _mat(result_graph, "$")
-
+    """Délègue au pipeline central pour garantir l'unicité du comportement."""
+    return inline_and_project_expected(entry, func_qualname=func_qualname, tuples_as_lists=True)
 
 def _plan_invocation_and_rehydration(
     *,
