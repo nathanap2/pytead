@@ -5,7 +5,6 @@ from typing import Any, Dict, Iterable, List, Tuple, Optional
 
 from .config_cli import diagnostics_for_storage_dir
 
-from .._cases import unique_cases
 
 
 __all__ = [
@@ -60,12 +59,28 @@ def split_targets_and_cmd(
     return t, c
 
 
-def unique_count(entries_by_func: Dict[str, List[Dict[str, Any]]]) -> int:
+    
+def unique_count(entries_by_func):
     """
-    Return the total number of unique test cases across all functions.
+    Count unique cases.
+    - graph-json: uniqueness by JSON value of (args_graph, kwargs_graph, result_graph)
+    - pickle (legacy state-based): reuse TraceCase hashing
     """
-    return sum(len(unique_cases(entries)) for entries in entries_by_func.values())
-
+    import json
+    total = 0
+    for entries in entries_by_func.values():
+        if entries and ("args_graph" not in entries[0]):
+            from .._cases import unique_cases  # lazy import
+            total += len(unique_cases(entries))
+            continue
+        def _norm(x):  # graph-json
+            return json.dumps(x, sort_keys=True, ensure_ascii=False)
+        seen = {
+            (_norm(e.get("args_graph")), _norm(e.get("kwargs_graph")), _norm(e.get("result_graph")))
+            for e in entries
+        }
+        total += len(seen) if seen else len(entries)
+    return total
 
 
 def fallback_targets_from_cfg(

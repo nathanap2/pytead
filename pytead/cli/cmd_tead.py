@@ -224,8 +224,8 @@ def add_tead_subparser(subparsers) -> None:
     p = subparsers.add_parser("tead", help="trace and immediately generate tests (all-in-one)")
     p.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS)
     p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS)
-    p.add_argument("--format", choices=["pickle", "repr", "graph-json"], default=argparse.SUPPRESS)
-    p.add_argument("--gen-formats", choices=["pickle", "repr", "graph-json"], nargs="*", default=argparse.SUPPRESS)
+    p.add_argument("--format", choices=["pickle", "graph-json"], default=argparse.SUPPRESS)
+    p.add_argument("--gen-formats", choices=["pickle", "graph-json"], nargs="*", default=argparse.SUPPRESS)
 
     p.add_argument("--only-targets", action="store_true", default=argparse.SUPPRESS)
     grp = p.add_mutually_exclusive_group()

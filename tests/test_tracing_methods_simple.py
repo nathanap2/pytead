@@ -3,21 +3,21 @@ from pathlib import Path
 import inspect
 
 from pytead.tracing import trace
-from pytead.storage import ReprStorage, iter_entries
+from pytead.storage import iter_entries
 
 
-def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
+import inspect
+from pathlib import Path
+
+from pytead.tracing import trace
+from pytead.storage import GraphJsonStorage, iter_entries
+
+def test_tracing_methods_decorator_like_wrapping__graphjson(tmp_path: Path):
     """
     Phase 1: ensure method traces carry module.Class.method via __qualname__,
     and that storage works identically for instance/static/class methods.
-
-    We mimic the CLI's descriptor-aware wrapping at definition site:
-    - instance method: wrap function and rebind on the class
-    - staticmethod/classmethod: wrap underlying __func__, then rewrap
-
-    NOTE: use ReprStorage because local classes/instances aren't picklable.
     """
-    st = ReprStorage()
+    st = GraphJsonStorage()
 
     class Calc:
         @staticmethod
@@ -36,14 +36,14 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     # Instance method: attribute on the class is a plain function → wrap and rebind
     Calc.add = trace(limit=10, storage_dir=tmp_path, storage=st)(Calc.add)
 
-    # Static method: get the descriptor, wrap __func__, then reattach as staticmethod
+    # Static method: wrap underlying __func__, then reattach as staticmethod
     sm_raw = inspect.getattr_static(Calc, "smul")
     assert isinstance(sm_raw, staticmethod)
     Calc.smul = staticmethod(
         trace(limit=10, storage_dir=tmp_path, storage=st)(sm_raw.__func__)
     )
 
-    # Class method: get the descriptor, wrap __func__, then reattach as classmethod
+    # Class method: wrap underlying __func__, then reattach as classmethod
     cm_raw = inspect.getattr_static(Calc, "tag")
     assert isinstance(cm_raw, classmethod)
     Calc.tag = classmethod(
@@ -56,7 +56,7 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert Calc.tag("X") == "Calc:X"
 
     # --- Read back entries ---
-    entries = list(iter_entries(tmp_path, formats=["repr"]))
+    entries = list(iter_entries(tmp_path, formats=["graph-json"]))
     names = sorted(e["func"] for e in entries)
 
     # Qualnames should include the class
@@ -64,22 +64,26 @@ def test_tracing_methods_decorator_like_wrapping(tmp_path: Path):
     assert any(n.endswith(".Calc.smul") for n in names)
     assert any(n.endswith(".Calc.tag") for n in names)
 
-    # Sanity on args/results for each (repr uses string placeholders for non-literal objects)
     by = {e["func"]: e for e in entries}
 
-    # add(self, 2, 3) — first arg is repr(self) as a str; tail are the numbers
-    k_add = next(k for k in by if k.endswith(".Calc.add"))
-    assert by[k_add]["result"] == 5
-    assert isinstance(by[k_add]["args"][0], str) and "Calc" in by[k_add]["args"][0]
-    assert by[k_add]["args"][1:] == (2, 3)
+    # Instance method: args_graph = [self_graph, 2, 3], result_graph = 5
+    e_add = by[next(k for k in by if k.endswith(".Calc.add"))]
+    ag = e_add.get("args_graph", [])
+    assert e_add["result_graph"] == 5
+    assert isinstance(ag, list) and len(ag) >= 3
+    assert isinstance(ag[0], dict)      # self capturé comme graphe (porte en général $id/attributs)
+    assert ag[1:] == [2, 3]
 
-    # staticmethod: plain args
-    k_smul = next(k for k in by if k.endswith(".Calc.smul"))
-    assert by[k_smul]["args"] == (4, 5) and by[k_smul]["result"] == 20
+    # Staticmethod: args_graph = [4, 5], result_graph = 20 (pas de self/cls)
+    e_smul = by[next(k for k in by if k.endswith(".Calc.smul"))]
+    assert e_smul.get("args_graph") == [4, 5]
+    assert e_smul.get("result_graph") == 20
 
-    # classmethod: first arg is repr(cls) as a str; tail is ("X",)
-    k_tag = next(k for k in by if k.endswith(".Calc.tag"))
-    assert isinstance(by[k_tag]["args"][0], str) and "Calc" in by[k_tag]["args"][0]
-    assert by[k_tag]["args"][1:] == ("X",)
-    assert by[k_tag]["result"] == "Calc:X"
+    # Classmethod: args_graph = [cls_graph, "X"], result_graph = "Calc:X"
+    e_tag = by[next(k for k in by if k.endswith(".Calc.tag"))]
+    ag_tag = e_tag.get("args_graph", [])
+    assert isinstance(ag_tag, list) and len(ag_tag) == 2
+    assert isinstance(ag_tag[0], dict)   # la classe est capturée comme graphe
+    assert ag_tag[1] == "X"
+    assert e_tag.get("result_graph") == "Calc:X"
 

@@ -8,7 +8,6 @@ import textwrap
 import re
 
 import pytead.gen_tests as gen
-from pytead.storage import ReprStorage  # NEW
 
 
 def _w(p: Path, s: str) -> Path:
@@ -40,58 +39,19 @@ def _assert_passed(stdout: str, expected: int) -> None:
     assert got == expected, f"expected {expected} passed, got {got}\n\nSTDOUT:\n{stdout}"
 
 
-def test_render_tests_header_allows_import_outside_root(tmp_path: Path):
-    """
-    Vérifie que les tests générés (format legacy) peuvent importer du code
-    situé dans un répertoire additionnel spécifié via `import_roots`.
-    """
-    root = tmp_path
 
-    # Marque la racine pour le header (_find_root cherche .pytead/ ou pyproject.toml)
-    _w(root / "pyproject.toml", "[build-system]\nrequires=[]\nbuild-backend=''\n")
+import argparse
+from pathlib import Path
 
-    # Module sous "src/app/utils.py" (hors racine)
-    _w(root / "src/app/__init__.py", "")
-    _w(
-        root / "src/app/utils.py",
-        """
-        def add(a, b):
-            return a + b
-        """,
-    )
+from pytead.storage import GraphJsonStorage
+from pytead.cli.cmd_gen import _handle as gen_handle
 
-    # Traces synthétiques = 2 cas → 2 tests paramétrés
-    entries = {
-        "app.utils.add": [
-            {"func": "app.utils.add", "args": (2, 3), "kwargs": {}, "result": 5},
-            {"func": "app.utils.add", "args": (10, 0), "kwargs": {}, "result": 10},
-        ]
-    }
+# helpers supposés déjà présents dans ton fichier de tests :
+# _w(path: Path, text: str) -> None
+# _run_pytest_in(root: Path) -> CompletedProcess
+# _assert_passed(pytest_stdout: str, expected: int) -> None
 
-    # Génère un test avec import_roots = [".", "src"]
-    source = gen._render_legacy_tests(entries, import_roots=[".", "src"])
-
-    # Crée le fichier de test généré
-    test_dir = root / "tests/generated"
-    test_dir.mkdir(parents=True)
-    _w(test_dir / "test_add.py", source)
-
-    # Lance pytest sur le répertoire racine du projet temporaire
-    res = _run_pytest_in(root)
-
-    # Vérifie que l'exécution de pytest a réussi
-    if res.returncode != 0:
-        raise AssertionError(
-            f"pytest failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
-        )
-
-    # Vérification : s'assurer que les tests ont bien tourné
-    assert "2 passed" in res.stdout
-
-
-def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkeypatch):
-    from pytead.cli.cmd_gen import _handle as gen_handle
-
+def test_cmd_gen_generates_tests_with_header_and_they_run__graphjson(tmp_path: Path, monkeypatch):
     root = tmp_path
 
     # Racine détectable
@@ -107,6 +67,7 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
         """,
     )
 
+    # Config CLI pour gen (lecture des traces + sortie par fonction)
     _w(
         root / ".pytead/config.toml",
         """
@@ -117,42 +78,43 @@ def test_cmd_gen_generates_tests_with_header_and_they_run(tmp_path: Path, monkey
         """,
     )
 
-    # Traces REPR minimalistes dans calls_dir (2 cas attendus)
+    # Traces GRAPH-JSON minimalistes dans calls_dir (2 cas attendus)
     calls_dir = root / "calls"
     calls_dir.mkdir(parents=True, exist_ok=True)
 
-    st = ReprStorage()
-    st.dump(
+    gst = GraphJsonStorage()
+    gst.dump(
         {
-            "trace_schema": "pytead/v1",
+            "trace_schema": "pytead/v2-graph",
             "func": "app.utils.mul",
-            "args": (2, 3),
-            "kwargs": {},
-            "result": 6,
+            "args_graph": [2, 3],
+            "kwargs_graph": {},
+            "result_graph": 6,
             "timestamp": "2025-01-01T00:00:00Z",
         },
-        calls_dir / "app_utils_mul__1.repr",
+        calls_dir / "app_utils_mul__1.gjson",
     )
-    st.dump(
+    gst.dump(
         {
-            "trace_schema": "pytead/v1",
+            "trace_schema": "pytead/v2-graph",
             "func": "app.utils.mul",
-            "args": (10, 0),
-            "kwargs": {},
-            "result": 0,
+            "args_graph": [10, 0],
+            "kwargs_graph": {},
+            "result_graph": 0,
             "timestamp": "2025-01-01T00:00:01Z",
         },
-        calls_dir / "app_utils_mul__2.repr",
+        calls_dir / "app_utils_mul__2.gjson",
     )
 
     # Appelle le handler "gen" (CWD = racine du projet)
     monkeypatch.chdir(root)
-    ns = argparse.Namespace()  # pas d'options CLI → rempli par la config
+    ns = argparse.Namespace()  # pas d’options CLI → rempli par la config [gen]
     gen_handle(ns)
 
-    # Vérifie qu'au moins un test a été généré
-    generated = list((root / "tests/gen").glob("test_app_utils_mul.py"))
-    assert generated, "no generated test found"
+    # Vérifie qu’au moins un test a été généré
+    # (pour graph-json: un fichier *par fonction*, suffixé "_snapshots")
+    generated = list((root / "tests/gen").glob("test_app_utils_mul_snapshots.py"))
+    assert generated, "no generated test found (expected test_app_utils_mul_snapshots.py)"
 
     # Lance pytest et vérifie le bon nombre de cas (2)
     res = _run_pytest_in(root)

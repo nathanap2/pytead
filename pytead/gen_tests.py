@@ -20,16 +20,83 @@ from typing import Any, Dict, List, Union, Optional, Tuple, Set
 from contextlib import contextmanager
 
 from .storage import iter_entries
-from ._cases import unique_cases as unique_legacy_cases, render_case
+
 from .normalize import sanitize_for_py_literals, tuples_to_lists
 
 from .errors import GenerationError, OrphanRefInExpected
-from .graph_utils import project_v2_to_v1, find_orphan_refs, _build_ref_donor_index, _inline_external_refs_in_expected
-
+from .graph_utils import find_orphan_refs
+from ._cases import unique_cases, render_case, case_id
 
 __all__ = ["collect_entries", "render_tests", "write_tests", "write_tests_per_func"]
 log = logging.getLogger("pytead.gen")
 
+def _contains_bare_refs(node) -> bool:
+    from .graph_utils import iter_bare_refs_with_paths
+    if node is None:
+        return False
+    try:
+        next(iter_bare_refs_with_paths(node))
+        return True
+    except StopIteration:
+        return False
+
+def is_tree_entry(entry: dict) -> bool:
+    """
+    Un appel est un 'arbre' si args_graph / kwargs_graph / result_graph
+    ne contiennent aucun {'$ref': N}. On ne fait AUCUNE autre heuristique.
+    """
+    return not (
+        _contains_bare_refs(entry.get("args_graph")) or
+        _contains_bare_refs(entry.get("kwargs_graph")) or
+        _contains_bare_refs(entry.get("result_graph"))
+    )
+    
+def render_readable_value_test_body(
+    func_name: str,
+    entry: dict,
+    param_types: dict[str, Any],
+    owner_class: Optional[str] = None,
+) -> str:
+    import uuid
+
+    args_graph = entry.get("args_graph", [])
+    kwargs_graph = entry.get("kwargs_graph", {})
+    # On garde la même préparation d'expected que pour les snapshots (v1-like, sans $id)
+    expected_graph = compute_expected_snapshot(entry, func_qualname=func_name)
+
+    # Plan d'invocation (identique aux snapshots, donc robuste pour méthodes/kwargs)
+    owner_lines, rehydrate_lines, call_line, wrapper_block = _plan_invocation_and_rehydration(
+        func_name=func_name,
+        owner_class=owner_class,
+        param_types=param_types,
+        args_graph=args_graph,
+        kwargs_graph=kwargs_graph,
+    )
+
+    test_name = f"test_{func_name}_readable_{uuid.uuid4().hex[:8]}"
+
+    lines: list[str] = []
+    lines.append(f"def {test_name}():")
+    lines.append("    # 1) Graphs embedded (tree -> readable value comparison)")
+    lines.append(f"    args_graph = {_fmt_literal_for_embed(args_graph)}")
+    lines.append(f"    kwargs_graph = {_fmt_literal_for_embed(kwargs_graph)}")
+    lines.append(f"    expected_graph = {_fmt_literal_for_embed(expected_graph)}")
+    lines.append("")
+    lines.append("    # 2) Normalize/rehydrate arguments")
+    lines.append("    from pytead.testkit import graph_to_data, rehydrate_from_graph")
+    lines.extend(owner_lines or [])
+    lines.extend(rehydrate_lines or ["    pass"])
+    lines.append("")
+    lines.append("    # 3) Invoke the target")
+    lines.append(call_line)
+    lines.append("")
+    lines.append("    # 4) Compare Python values (mild normalization for literals)")
+    lines.append("    from pytead.normalize import sanitize_for_py_literals, tuples_to_lists")
+    lines.append("    expected = graph_to_data(expected_graph)")
+    lines.append("    def _norm(x):")
+    lines.append("        return sanitize_for_py_literals(tuples_to_lists(x))")
+    lines.append("    assert _norm(real_result) == _norm(expected)")
+    return "\n".join(lines)
 
 
 
@@ -426,94 +493,6 @@ def _get_param_info(func_fqn: str, is_method: bool | None = None) -> tuple[dict[
 
 
 
-    
-def compute_call_signature(
-    func_name: str,
-    entry: dict,
-    param_types: dict[str, Any],
-    owner_class: Optional[str] = None,
-) -> tuple[list[str], str]:
-    """
-    Construit (rehydrate_lines, call_line) pour le corps de test généré.
-    - rehydrate_lines: lignes de code (str) qui normalisent/rehydratent les args
-    - call_line: ligne qui effectue l'appel réel et stocke le résultat dans `real_result`
-    Ne dépend d'aucun état global (renvoie juste des chaînes prêtes à coller).
-    """
-    args_graph = entry.get("args_graph", [])
-    kwargs_graph = entry.get("kwargs_graph", {})
-
-    lines_rehydrate: list[str] = []
-    owner_offset = 0
-
-    # Cas méthode: si self capturé en args[0], on le rehydrate
-    if owner_class:
-        if isinstance(args_graph, list) and len(args_graph) >= 1:
-            lines_rehydrate.append(
-                f"    self_instance = rehydrate_from_graph(graph_to_data(args_graph[0]), {owner_class})"
-            )
-            owner_offset = 1
-        else:
-            # Méthode sans self capturé et sans kwargs -> petit wrapper zéro-arg
-            if not kwargs_graph:
-                wrapper = [
-                    f"    def {func_name}():",
-                    f"        return {owner_class}().{func_name}()",
-                ]
-                call_line = f"    real_result = {func_name}()"
-                return (wrapper, call_line)
-
-    # Nombre d'args positionnels hors self
-    effective_args = max(0, (len(args_graph) if isinstance(args_graph, list) else 0) - owner_offset)
-
-    # Noms de paramètres
-    param_names = list(param_types.keys())
-    hydrated_names: list[str] = []
-
-    # Si la longueur colle exactement, on exploite les hints pour rehydrate_from_graph
-    if param_names and len(param_names) == effective_args:
-        for i, name in enumerate(param_names):
-            src_idx = i + owner_offset
-            var = f"hydrated_arg_{i}"
-            hydrated_names.append(var)
-            cls = param_types.get(name)
-            if isinstance(cls, type) and getattr(cls, "__module__", "") != "builtins":
-                lines_rehydrate.append(
-                    f"    {var} = rehydrate_from_graph(graph_to_data(args_graph[{src_idx}]), {cls.__name__})"
-                )
-            else:
-                lines_rehydrate.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
-    else:
-        # Fallback structurel: graph_to_data pour chaque arg
-        for i in range(effective_args):
-            src_idx = i + owner_offset
-            var = f"hydrated_arg_{i}"
-            hydrated_names.append(var)
-            lines_rehydrate.append(f"    {var} = graph_to_data(args_graph[{src_idx}])")
-
-    # Kwargs: toujours normalisés
-    if kwargs_graph:
-        lines_rehydrate.append("    kwargs_graph = graph_to_data(kwargs_graph)")
-
-    # Signature d'appel
-    if hydrated_names and kwargs_graph:
-        call_sig = f"{', '.join(hydrated_names)}, **kwargs_graph"
-    elif hydrated_names:
-        call_sig = ", ".join(hydrated_names)
-    elif kwargs_graph:
-        call_sig = "**kwargs_graph"
-    else:
-        call_sig = ""
-
-    # Ligne d'appel (méthode vs fonction)
-    call_line = (
-        f"    real_result = self_instance.{func_name}({call_sig})"
-        if owner_class
-        else
-        f"    real_result = {func_name}({call_sig})"
-    )
-
-    return lines_rehydrate or ["    pass"], call_line
-
 
 
 def _fmt_literal_for_embed(obj: Any) -> str:
@@ -807,6 +786,43 @@ def render_graph_snapshot_test_body(
     lines.append("    assert_match_graph_snapshot(real_result, expected_graph)")
     return "\n".join(lines)
 
+def render_state_tests(
+    entries_by_func: Dict[str, List[Dict[str, Any]]],
+    import_roots: Optional[List[Union[str, Path]]] = None,
+) -> str:
+    """
+    Render **state-based (pickle)** tests in a single module (pytest parameterized).
+    This is the canonical generator for the pickle-backed format.
+    """
+    lines: List[str] = [
+        "# Auto-generated by pytead - state-based (pickle) tests",
+        "import pytest",
+        "from pytead.testkit import setup as _tk_setup, run_case as _tk_run, param_ids as _tk_ids",
+    ]
+    roots = import_roots if import_roots is not None else ["."]
+    joined_roots = ", ".join(repr(str(p)) for p in roots)
+    lines.append(f"_tk_setup(__file__, [{joined_roots}])")
+    lines.append("")
+    for func_fullname, entries in sorted(entries_by_func.items()):
+        cases = unique_cases(entries)
+        if not cases:
+            continue
+        parts = func_fullname.split(".")
+        module_path, func_name = ".".join(parts[:-1]), parts[-1]
+        module_sanitized = module_path.replace(".", "_") if module_path else "root"
+        cases_variable_name = f"CASES_{module_sanitized}_{func_name}"
+        lines.append(f"{cases_variable_name} = [")
+        for c in cases:
+            lines.extend(render_case(c, base_indent=4))
+        lines.append("]")
+        lines.append("")
+        lines.append(
+            f"@pytest.mark.parametrize('case', {cases_variable_name}, ids=_tk_ids({cases_variable_name}))"
+        )
+        lines.append(f"def test_{module_sanitized}_{func_name}(case):")
+        lines.append(f"    _tk_run({func_fullname!r}, case)")
+        lines.append("")
+    return "\n".join(lines)
 
 
 @contextmanager
@@ -901,61 +917,38 @@ def write_tests_per_func(
                 if line not in import_lines:
                     import_lines.append(line)
 
-            test_functions: List[str] = [
-                render_graph_snapshot_test_body(
-                    func_name, entry, param_types, owner_class=owner_cls
-                )
-                for entry in entries
-            ]
+#            test_functions: List[str] = [
+#                render_graph_snapshot_test_body(
+#                    func_name, entry, param_types, owner_class=owner_cls
+#                )
+#                for entry in entries
+#            ]
+            test_functions: List[str] = []
+            for entry in entries:
+                if is_tree_entry(entry):
+                    test_functions.append(
+                        render_readable_value_test_body(
+                            func_name, entry, param_types, owner_class=owner_cls
+                        )
+                    )
+                else:
+                    test_functions.append(
+                        render_graph_snapshot_test_body(
+                            func_name, entry, param_types, owner_class=owner_cls
+                        )
+                    )
 
             source = "\n".join(bootstrap_lines + import_lines) + "\n\n" + "\n\n".join(test_functions) + "\n"
             (out_path / filename).write_text(source, encoding="utf-8")
 
         else:
-            # Legacy: emit a single parameterized module aggregating cases
+            # State-based (pickle): single parameterized module aggregating cases
             filename = f"test_{module_sanitized}.py"
             source = _render_legacy_tests({func_fullname: entries}, import_roots=resolved_roots)
             (out_path / filename).write_text(
                 source + ("" if source.endswith("\n") else "\n"),
                 encoding="utf-8",
             )
-
-
-def _render_legacy_tests(
-    entries_by_func: Dict[str, List[Dict[str, Any]]],
-    import_roots: Optional[List[Union[str, Path]]] = None,
-) -> str:
-    """
-    Render legacy, state-based tests in a single module (pytest parameterized).
-    """
-    lines: List[str] = [
-        "# Auto-generated by pytead - Legacy format",
-        "import pytest",
-        "from pytead.testkit import setup as _tk_setup, run_case as _tk_run, param_ids as _tk_ids",
-    ]
-    roots = import_roots if import_roots is not None else ["."]
-    joined_roots = ", ".join(repr(str(p)) for p in roots)
-    lines.append(f"_tk_setup(__file__, [{joined_roots}])")
-    lines.append("")
-    for func_fullname, entries in sorted(entries_by_func.items()):
-        cases = unique_legacy_cases(entries)
-        if not cases:
-            continue
-        parts = func_fullname.split(".")
-        module_path, func_name = ".".join(parts[:-1]), parts[-1]
-        module_sanitized = module_path.replace(".", "_") if module_path else "root"
-        cases_variable_name = f"CASES_{module_sanitized}_{func_name}"
-        lines.append(f"{cases_variable_name} = [")
-        for c in cases:
-            lines.extend(render_case(c, base_indent=4))
-        lines.append("]")
-        lines.append("")
-        lines.append(f"@pytest.mark.parametrize('case', {cases_variable_name}, ids=_tk_ids({cases_variable_name}))")
-        lines.append(f"def test_{module_sanitized}_{func_name}(case):")
-        lines.append(f"    _tk_run({func_fullname!r}, case)")
-        lines.append("")
-    return "\n".join(lines)
-
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -984,17 +977,14 @@ def render_tests(
     entries_by_func: Dict[str, List[Dict[str, Any]]],
     import_roots: Optional[List[Union[str, Path]]] = None,
 ) -> str:
-    """
-    Render tests either as legacy (single module) or inform the caller that
-    graph-json requires per-function files.
-    """
+    """If pickle → return a single module; if graph-json → instruct per-function mode."""
     if not entries_by_func:
         return ""
     sample_trace = next(iter(entries_by_func.values()))[0]
-    if "args_graph" in sample_trace:
-        return "# Graph snapshot tests are generated one per file. Use --output-dir."
-    else:
-        return _render_legacy_tests(entries_by_func, import_roots)
+    if "args_graph" not in sample_trace:
+        return render_state_tests(entries_by_func, import_roots=import_roots or [])
+    return "# Graph snapshot tests are generated one per file. Use --output-dir."
+
 
 
 def write_tests(source: str, output_file: Union[str, Path]) -> None:

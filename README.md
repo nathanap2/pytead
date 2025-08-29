@@ -78,7 +78,7 @@ pytead run [options] <module.function|module.Class.method> [...] -- <script.py> 
 
 * `-l, --limit INT` — max calls to record per function/method
 * `-s, --storage-dir PATH` — where to write trace files (default via config; packaged default: `call_logs/`)
-* `--format {pickle,repr,graph-json}` — storage format
+* `--format {pickle,graph-json}` — storage format
 * `--additional-sys-path PATH...` — extra import roots (relative paths are anchored on the project root)
 
 **Notes**
@@ -102,14 +102,10 @@ pytead gen [options]
 * `-c, --storage-dir PATH` — directory containing trace files
 * `-o, --output PATH` — write a single test module
 * `-d, --output-dir PATH` — write **one test module per function** into this directory
-* `--formats {pickle,repr,graph-json}...` — restrict which formats to read
+* `--formats {pickle,graph-json}...` — restrict which formats to read
 * `--additional-sys-path PATH...` — extra import roots to embed in generated tests
 
-**Behavior**
-
-* Exact **duplicates** (same args/kwargs/result) are deduplicated.
-* **State-based formats** inline values with `repr(...)`.
-* **Graph snapshots** are generated **one file per function** (with import bootstrap and dedicated assertions).
+Note : exact **duplicates** (same args/kwargs/result) are deduplicated.
 
 ---
 
@@ -121,7 +117,7 @@ pytead tead [options] <module.function|module.Class.method> [...] -- <script.py>
 
 **Extras**
 
-* `--gen-formats {pickle,repr,graph-json}...`
+* `--gen-formats {pickle,graph-json}...`
 * `--only-targets` — only generate tests for the targets in this command
 * `-o/--output` or `-d/--output-dir` — same as `gen` (defaults to a single file if neither is provided)
 
@@ -159,7 +155,7 @@ pytead gen
 
 ## 🧠 Storage formats: when to use which?
 
-* **`repr`** (“state-based format”): great for pure-ish functions and simple objects; non-trivial objects are stringified in a stable, literal-friendly way.
+
 * **`graph-json`**: captures **nested object graphs** (attributes of attributes, cycles, shared references via `{"$ref": N}`), and generates **standalone-ish** tests:
 
   * Arguments/results are rehydrated **without calling** user constructors.
@@ -286,7 +282,7 @@ Generated tests insert **import roots** (script dir, detected project root, plus
 ## 📚 Glossary
 
 * **Trace / Entry**: one recorded call (fully-qualified target, args/kwargs, result, timestamp).
-* **State-based formats**: `repr`, `pickle` — parameterized tests driven by values/state snapshots.
+* **State-based format**: `pickle` — parameterized tests driven by values/state snapshots.
 * **Graph snapshot (`graph-json`)**: deep data capture of object graphs (attributes), independent of concrete classes.
 * **Aliasing**: multiple paths pointing to the **same** object in memory; encoded as `{"$ref": N}`.
 * **De-alias (for comparison)**: expand/ignore alias markers to compare structures fairly.

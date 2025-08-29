@@ -1007,12 +1007,14 @@ def run_case(func_fq: str, case: Case) -> None:
         assert out == expected
 
 
-def param_ids(cases: Sequence[Case], maxlen: int = 80) -> List[str]:
-    """
-    Generate readable IDs for pytest.parametrize from a sequence of legacy cases.
-    """
-    ids: List[str] = []
-    for args, kwargs, *_ in cases:
-        ids.append(_case_id(args, kwargs, maxlen=maxlen))
-    return ids
 
+
+Case = Tuple[Any, Any, Any, Any, Any, Any, Any]  # (args, kwargs, expected, self_type, self_state, obj_args, result_spec)
+
+def _id_from_args_kwargs(args: tuple, kwargs: dict, maxlen: int) -> str:
+    base = repr(args) if not kwargs else f"{repr(args)} {repr(kwargs)}"
+    return base if len(base) <= maxlen else base[: maxlen - 3] + "..."
+
+def param_ids(cases: Sequence[Case], maxlen: int = 80) -> List[str]:
+    """Generate readable IDs for pytest.parametrize from legacy cases."""
+    return [_id_from_args_kwargs(args, kwargs, maxlen) for (args, kwargs, *_) in cases]

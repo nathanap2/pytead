@@ -14,7 +14,6 @@ from pytead.graph_capture import capture_object_graph
 
 from pytead.gen_tests import (
     _assert_no_orphan_refs_in_expected,
-    _inline_external_refs_in_expected,
 )
 from pytead.graph_utils import collect_anchor_ids, iter_bare_refs_with_paths, find_orphan_refs
 
@@ -82,13 +81,6 @@ def test_assert_orphan_refs_detects_and_points_paths():
     assert "path=$.a" in msg  # JSONPath is reported
     assert "ref=42" in msg
 
-
-def test_inlining_uses_donors_to_resolve_refs():
-    donors = [{"$id": 7, "x": 1}, {}]
-    expected = {"res": {"$ref": 7}}
-    inlined = _inline_external_refs_in_expected(expected, {7: donors[0]})
-    # after inlining, no bare '$ref' should remain
-    assert not _has_bare_ref(inlined)
 
 
 

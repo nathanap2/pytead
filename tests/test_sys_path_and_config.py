@@ -112,7 +112,7 @@ def make_repo_with_yaml(tmp_path: Path):
         defaults:
           limit: 9
           storage_dir: "ylogs"
-          format: "repr"
+          format: "graph-json"
         run:
           targets:
             - ioutils.example

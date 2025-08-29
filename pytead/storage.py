@@ -125,33 +125,6 @@ class PickleStorage(_BaseStorage):
 
 
 
-class ReprStorage(_BaseStorage):
-    extension = ".repr"
-
-    def dump(self, entry: Dict[str, Any], path: Path) -> None:  # atomique
-        import os, tempfile
-        tmp_name = None
-        try:
-            lit = _to_literal(entry)
-            txt = pprint.pformat(lit, width=100, sort_dicts=True)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8") as tmp:
-                tmp.write(txt + "\n")
-                tmp_name = tmp.name
-            os.replace(tmp_name, path)
-        except Exception as exc:
-            try:
-                if tmp_name:
-                    os.unlink(tmp_name)
-            except Exception:
-                pass
-            log.error("Failed to write repr %s: %s", path, exc)
-
-    def load(self, path: Path) -> Dict[str, Any]:  # <-- RESTAURÉ
-        txt = path.read_text(encoding="utf-8")
-        data = ast.literal_eval(txt)
-        return data
-
 class GraphJsonStorage(_BaseStorage):
     """
     Storage backend for the *graph-json* format.
@@ -315,7 +288,6 @@ class GraphJsonStorage(_BaseStorage):
             
 _REGISTRY: Dict[str, StorageLike] = {
     "pickle": PickleStorage(),
-    "repr": ReprStorage(),
     "graph-json": GraphJsonStorage(),
 }
 

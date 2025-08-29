@@ -169,7 +169,7 @@ def add_types_subparser(subparsers) -> None:
     )
     p.add_argument(
         "--formats",
-        choices=["pickle", "repr"],
+        choices=["pickle"],
         nargs="*",
         default=argparse.SUPPRESS,
         help="restrict formats when reading traces",

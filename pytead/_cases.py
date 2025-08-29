@@ -8,15 +8,6 @@ import pprint
 _WRAP_WIDTH = 88
 
 #
-# Module-level Role:
-# This module is dedicated to handling "legacy" state-based test cases.
-# It defines the core `TraceCase` data structure, which holds all information
-# needed to replay a function call (args, kwargs, expected result, object states).
-# It also provides the utilities to deduplicate these cases and render them
-# into Python code for the `pytest.mark.parametrize` feature.
-#
-# NOTE: This module is NOT used for the newer `graph-json` snapshot tests.
-#
 
 def _to_hashable(obj: Any) -> Any:
     """
