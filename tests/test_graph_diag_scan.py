@@ -4,7 +4,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from pytead.storage import iter_entries, GraphJsonStorage
-from pytead.graph_utils import find_orphan_refs
+from pytead.graph_utils import find_orphan_refs_in_rendered
 
 def _scan_entries_for_orphans(entries_by_func: dict[str, list[dict]]):
     report = {}
@@ -13,7 +13,7 @@ def _scan_entries_for_orphans(entries_by_func: dict[str, list[dict]]):
         for e in entries:
             eg = e.get("result_graph")
             if eg is not None:
-                orphans.extend(find_orphan_refs(eg))
+                orphans.extend(find_orphan_refs_in_rendered(eg))
         report[fqn] = {"entries": len(entries), "orphans": orphans}
     return report
 

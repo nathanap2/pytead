@@ -217,7 +217,8 @@ only_targets = true
   * for each trace:
 
     * **rehydrates** arguments (no `__init__` calls) and calls the function/method,
-    * compares the **data graph** of the result via `assert_match_graph_snapshot`.
+    * compares the **rendered graph** (no `$id`; external refs inlined) via `assert_match_graph_snapshot`.
+
 
 **Normalization in tests** (so they remain stable and valid Python):
 

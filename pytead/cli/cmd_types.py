@@ -46,7 +46,7 @@ def _detect_project_root(ctx, explicit: Path | None) -> Path:
 def _load_effective_types_config(args: argparse.Namespace, start: Path | None):
     """
     Load layered config and fill args fields that are missing. Then read the effective
-    [types] section so we can map storage_dir -> calls_dir.
+    [types] section so we can map storage_dir -> out_dir defaults.
     """
     ctx = load_layered_config(start=start)
     apply_effective_to_args("types", ctx, args)
@@ -54,17 +54,19 @@ def _load_effective_types_config(args: argparse.Namespace, start: Path | None):
     return ctx, eff_types
 
 
-def _finalize_io_paths(project_root: Path, calls_dir: Path | None, out_dir: Path | None, eff_types: dict):
-    if calls_dir is None:
+def _finalize_io_paths(project_root: Path, storage_dir: Path | None, out_dir: Path | None, eff_types: dict):
+    """
+    Resolve storage_dir/out_dir using CLI overrides, effective config, and project_root anchoring.
+    """
+    if storage_dir is None:
         cfg_calls = eff_types.get("storage_dir")
-        calls_dir = _as_path(cfg_calls)
+        storage_dir = _as_path(cfg_calls)
     if out_dir is None:
         cfg_out = eff_types.get("out_dir")
         out_dir = _as_path(cfg_out)
-    calls_dir = _resolve_under(project_root, calls_dir) if calls_dir else None
+    storage_dir = _resolve_under(project_root, storage_dir) if storage_dir else None
     out_dir = _resolve_under(project_root, out_dir) if out_dir else None
-    return calls_dir, out_dir
-
+    return storage_dir, out_dir
 
 
 def _require(cond: bool, log, msg: str) -> None:
@@ -118,25 +120,33 @@ def _handle(args: argparse.Namespace) -> None:
 
     # Decide final project root and anchor paths under it
     project_root = _detect_project_root(ctx, explicit_root)
-    calls_dir = _as_path(getattr(args, "calls_dir", None))
+
+    # Preferred flag
+    storage_dir = _as_path(getattr(args, "storage_dir", None))
+    # Back-compat (hidden): legacy --calls-dir
+    deprecated_calls = _as_path(getattr(args, "storage_dir_deprecated", None))
+    if storage_dir is None and deprecated_calls is not None:
+        storage_dir = deprecated_calls
+        log.warning("Option --calls-dir is deprecated; use --storage-dir instead.")
+
     out_dir = _as_path(getattr(args, "out_dir", None))
     formats = getattr(args, "formats", None)
 
-    calls_dir, out_dir = _finalize_io_paths(project_root, calls_dir, out_dir, eff_types)
+    storage_dir, out_dir = _finalize_io_paths(project_root, storage_dir, out_dir, eff_types)
 
-    _require(calls_dir is not None and out_dir is not None,
-             log, "You must provide both --calls-dir and --out-dir (or set them in [types]).")
+    _require(storage_dir is not None and out_dir is not None,
+             log, "You must provide both --storage-dir and --out-dir (or set them in [types]).")
 
-    _require(calls_dir.exists() and calls_dir.is_dir(),
-             log, f"Calls directory '{calls_dir}' does not exist or is not a directory")
+    _require(storage_dir.exists() and storage_dir.is_dir(),
+             log, f"Storage directory '{storage_dir}' does not exist or is not a directory")
 
     # Ensure imports from the project resolve during summarization
     _insert_project_on_sys_path(project_root)
 
     # Collect traces and summarize type information
-    entries_by_func: Dict[str, List[dict]] = collect_entries(storage_dir=calls_dir, formats=formats)
+    entries_by_func: Dict[str, List[dict]] = collect_entries(storage_dir=storage_dir, formats=formats)
     if not entries_by_func:
-        log.error("No traces found in '%s' (formats=%s).", calls_dir, formats or "auto")
+        log.error("No traces found in '%s' (formats=%s).", storage_dir, formats or "auto")
         sys.exit(1)
 
     typed_infos = _summarize_entries_by_func(log, entries_by_func)
@@ -153,13 +163,15 @@ def add_types_subparser(subparsers) -> None:
     p = subparsers.add_parser(
         "types", help="infer types from traces and emit .pyi stub files"
     )
+    
     p.add_argument(
-        "-c",
-        "--calls-dir",
+        "-s",
+        "--storage-dir",
         type=Path,
         default=argparse.SUPPRESS,
         help="directory containing trace files (if omitted, uses [types].storage_dir)",
     )
+    
     p.add_argument(
         "-o",
         "--out-dir",

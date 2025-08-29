@@ -76,22 +76,22 @@ class C:
     assert ".m(" in txt  # l’appel se fait via la méthode
 
 
-from pytead.graph_utils import find_orphan_refs
+from pytead.graph_utils import find_orphan_refs_in_rendered
 
 def test_find_orphan_refs_uses_kwargs_as_donors():
     expected = {"x": {"$ref": 7}}
     donors = [{"$id": 7, "k": "in_kwargs"}]  # simulateur de kwargs_graph
-    assert find_orphan_refs(expected, donors) == []
+    assert find_orphan_refs_in_rendered(expected, donors) == []
 
 def test_find_orphan_refs_uses_expected_internal_anchor():
     expected = {"x": {"$ref": 7}, "anchor": {"$id": 7, "v": 1}}
     donors = []  # aucun donor externe
-    assert find_orphan_refs(expected, donors) == []
+    assert find_orphan_refs_in_rendered(expected, donors) == []
 
 def test_find_orphan_refs_reports_true_orphan():
     expected = {"x": {"$ref": 9}}
     donors = [{"$id": 8, "k": "wrong"}]
-    orphans = find_orphan_refs(expected, donors)
+    orphans = find_orphan_refs_in_rendered(expected, donors)
     # Le path précis peut varier selon l’implémentation; on veut au moins le (path, 9)
     assert any(p.endswith(".x") and rid == 9 for (p, rid) in orphans) or \
            any(p in ("$.x", "$.x") and rid == 9 for (p, rid) in orphans)

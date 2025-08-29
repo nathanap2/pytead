@@ -11,8 +11,6 @@ import uuid
 import importlib
 import inspect
 import typing
-import math
-import copy
 import sys
 import importlib.util
 from types import ModuleType
@@ -24,7 +22,7 @@ from .storage import iter_entries
 from .normalize import sanitize_for_py_literals, tuples_to_lists
 
 from .errors import GenerationError, OrphanRefInExpected
-from .graph_utils import find_orphan_refs, inline_and_project_expected, project_v2_to_v1
+from .graph_utils import find_orphan_refs_in_rendered, inline_and_project_expected
 from ._cases import unique_cases, render_case, case_id
 
 
@@ -44,8 +42,7 @@ def _contains_bare_refs(node) -> bool:
 
 def is_tree_entry(entry: dict) -> bool:
     """
-    Un appel est un 'arbre' si args_graph / kwargs_graph / result_graph
-    ne contiennent aucun {'$ref': N}. On ne fait AUCUNE autre heuristique.
+    Heuristique “arbre” : aucun `{"$ref": N}` dans args/kwargs/result.
     """
     return not (
         _contains_bare_refs(entry.get("args_graph")) or
@@ -63,7 +60,7 @@ def render_readable_value_test_body(
 
     args_graph = entry.get("args_graph", [])
     kwargs_graph = entry.get("kwargs_graph", {})
-    # On garde la même préparation d'expected que pour les snapshots (v1-like, sans $id)
+    # On garde la même préparation d'expected que pour les snapshots (rendered, sans $id)
     expected_graph = compute_expected_snapshot(entry, func_qualname=func_name)
 
     # Plan d'invocation (identique aux snapshots, donc robuste pour méthodes/kwargs)
@@ -103,94 +100,6 @@ def render_readable_value_test_body(
 
 
 
-def _collect_id_map_gen(node: Any, out: dict[int, Any]) -> None:
-    """Mappe chaque '$id' -> noeud porteur, pour expansion des '$ref'."""
-    if isinstance(node, dict):
-        if "$id" in node:
-            out[node["$id"]] = node
-        for v in node.values():
-            _collect_id_map_gen(v, out)
-    elif isinstance(node, list):
-        for x in node:
-            _collect_id_map_gen(x, out)
-
-def _strip_ids_gen(node: Any) -> Any:
-    """Supprime tous les '$id' récursivement (non sémantique pour la valeur)."""
-    if isinstance(node, dict):
-        return {k: _strip_ids_gen(v) for k, v in node.items() if k != "$id"}
-    if isinstance(node, list):
-        return [_strip_ids_gen(x) for x in node]
-    return node
-
-def _expand_refs_cycle_safe_gen(node: Any, idmap: dict[int, Any], stack: set[int]) -> Any:
-    """
-    Remplace {'$ref': N} par l'expansion profonde de idmap[N], mais
-    **protège les cycles** : si N est déjà en cours d'expansion, on garde {'$ref': N}.
-    On propage aussi l'$id courant dans la pile pour détecter les back-refs.
-    """
-    if isinstance(node, dict):
-        # Cas 'pur' ref
-        if set(node.keys()) == {"$ref"}:
-            ref = node["$ref"]
-            if ref in idmap and ref not in stack:
-                stack.add(ref)
-                # on strippe l'$id du target avant descente, sinon bruit inutile
-                expanded = _expand_refs_cycle_safe_gen(_strip_ids_gen(idmap[ref]), idmap, stack)
-                stack.remove(ref)
-                return expanded
-            return node  # inconnu ou cycle détecté
-
-        # Dict normal : si porte un $id, on le pousse dans la pile le temps de descendre
-        pushed = None
-        if "$id" in node:
-            pushed = node["$id"]
-            stack.add(pushed)
-
-        out = {k: _expand_refs_cycle_safe_gen(v, idmap, stack) for k, v in node.items()}
-
-        if pushed is not None:
-            stack.remove(pushed)
-        return out
-
-    if isinstance(node, list):
-        return [_expand_refs_cycle_safe_gen(x, idmap, stack) for x in node]
-
-    return node
-
-def _unwrap_local_list_refs_gen(node: Any) -> Any:
-    """
-    Heuristique: dans une liste, si un élément est {'$ref': N} et qu'on n'a
-    aucun idmap pertinent, on recopie l'élément précédent (pattern simple
-    vu dans certaines traces).
-    """
-    if isinstance(node, list):
-        out = []
-        for i, x in enumerate(node):
-            if isinstance(x, dict) and set(x.keys()) == {"$ref"} and i > 0:
-                out.append(out[-1])
-            else:
-                out.append(_unwrap_local_list_refs_gen(x))
-        return out
-    if isinstance(node, dict):
-        return {k: _unwrap_local_list_refs_gen(v) for k, v in node.items()}
-    return node
-
-
-def normalize_graph_for_generation(graph: Any) -> Any:
-    """
-    Shim fin : sanitise et projette v2→v1 avec tuples→listes.
-    (Toute la logique d'inlining/refs vit dans graph_utils.)
-    """
-    return tuples_to_lists(project_v2_to_v1(sanitize_for_py_literals(graph), mode="expected", tuples_as_lists=True))
-
-
-
-
-
-
-# ---------------------------------------------------------------------------
-# Utilities for robust, refactoring-friendly test generation
-# ---------------------------------------------------------------------------
 
 
 
@@ -359,28 +268,6 @@ def _collect_ids_for_refcheck(node, out: set[int]) -> None:
 
 
 
-def _assert_no_orphan_refs_in_expected(expected_graph, donors_graphs, *, func_qualname: str = "") -> None:
-    """
-    Vérifie qu'il n'y a pas de {'$ref': N} orphelin dans expected_graph, en tenant compte
-    des ancres présentes dans donors_graphs (args/kwargs) ET dans expected_graph lui-même.
-    S'il y a des orphelins → OrphanRefInExpected (avec chemins JSONPath).
-    """
-    orphans = find_orphan_refs(expected_graph, donors_graphs)
-    if orphans:
-        try:
-            log.warning(
-                "ORPHAN_REF in expected snapshot for %s: %d orphan(s): %s",
-                func_qualname or "<unknown>",
-                len(orphans),
-                ", ".join(f"{p} -> ref={rid}" for p, rid in orphans),
-            )
-        except Exception:
-            pass
-        details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
-        raise OrphanRefInExpected(
-            "Unresolved {'$ref': N} in expected snapshot. "
-            f"Found {len(orphans)} orphan ref(s): {details}"
-        )
 
 
 def _get_param_info(func_fqn: str, is_method: bool | None = None) -> tuple[dict[str, Any], dict[str, set[str]]]:
@@ -492,10 +379,21 @@ def _fmt_literal_for_embed(obj: Any) -> str:
 
 
 
-
 def compute_expected_snapshot(entry: Dict[str, Any], *, func_qualname: str = "") -> Any:
-    """Délègue au pipeline central pour garantir l'unicité du comportement."""
-    return inline_and_project_expected(entry, func_qualname=func_qualname, tuples_as_lists=True)
+    """
+    Thin wrapper that delegates to the unified pipeline, ensuring a single,
+    consistent behavior for building the **rendered expected graph** from a trace entry.
+
+    Notes
+    -----
+    - `tuples_as_lists=True` normalizes tuples to lists in the rendered view
+      to keep snapshots JSON-friendly and assertion-stable.
+    """
+    return inline_and_project_expected(
+        entry,
+        func_qualname=func_qualname,
+        tuples_as_lists=True,
+    )
 
 def _plan_invocation_and_rehydration(
     *,

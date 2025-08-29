@@ -6,7 +6,7 @@ import logging
 import re
 from .errors import GraphCaptureRefToUnanchored
 
-from .graph_utils import project_v2_to_v1, find_orphan_refs
+from .graph_utils import project_anchored_to_rendered, find_orphan_refs_in_rendered
 
 _log = logging.getLogger("pytead.graph_capture")
 _OPAQUE_REPR_RE = re.compile(r"^<[\w\.]+ object at 0x[0-9A-Fa-f]+>$")
@@ -39,22 +39,33 @@ def _is_scalar(x: Any) -> bool:
     return x is None or isinstance(x, (bool, int, float, str, bytes))
 
 # ------------------------- CAPTURE IR v2 (tout ancré) -------------------------
-
-def capture_object_graph_v2(
+def capture_anchored_graph(
     obj: Any,
     *,
     max_depth: int = 5,
-    _memo: Optional[Dict[str, Any]] = None
+    _memo: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """
-    Capture en IR v2 : tout nœud référencable reçoit un '$id' (dict/objets, listes,
-    tuples, sets, mappings non-JSON via '$map'). Les réutilisations émettent {'$ref': id}.
+    Build an **anchored graph** (internal IR):
+
+    - Every referencable node receives a unique `$id` anchor (dicts/objects, lists,
+      tuples, sets/frozensets, and mappings with non-JSON keys encoded via `{"$map": ...}`).
+    - Repeated references are encoded as `{"$ref": id}`.
+    - Depth guard: when `max_depth` is exhausted, emit a stable textual placeholder.
+
+    Determinism
+    -----------
+    - Dicts with JSON-able keys keep insertion order.
+    - `$map` pairs and `$set` elements are sorted by `repr` for stable output.
+
+    Notes
+    -----
+    - Pure (does not mutate inputs); `_memo` is an internal alias/cycle tracker.
     """
     if _memo is None:
         _memo = {"labels": {}, "next": 1}
 
-    # Profondeur / feuilles
-
+    # Scalars or depth limit
     if _is_scalar(obj):
         return obj
     if max_depth <= 0:
@@ -63,58 +74,58 @@ def capture_object_graph_v2(
     oid = id(obj)
     labels: Dict[int, int] = _memo["labels"]
 
-    # Déjà vu → ref
+    # Seen before → back-reference
     if oid in labels:
         return {"$ref": labels[oid]}
 
-    # Première rencontre → label
+    # First time → allocate anchor
     label = _memo["next"]
     labels[oid] = label
     _memo["next"] = label + 1
 
-    # Dict (clés str → objet JSON; sinon → $map)
+    # Dict: JSON keys vs non-JSON keys ($map)
     if isinstance(obj, dict):
         if all(isinstance(k, str) for k in obj.keys()):
             node: Dict[str, Any] = {"$id": label}
-            for k, v in obj.items():  # ordre d’insertion stable
-                node[k] = capture_object_graph_v2(v, max_depth=max_depth - 1, _memo=_memo)
+            for k, v in obj.items():  # insertion order preserved
+                node[k] = capture_anchored_graph(v, max_depth=max_depth - 1, _memo=_memo)
             return node
         else:
             pairs: list[list[Any]] = []
             for k, v in obj.items():
-                kg = capture_object_graph_v2(k, max_depth=max_depth - 1, _memo=_memo)
-                vg = capture_object_graph_v2(v, max_depth=max_depth - 1, _memo=_memo)
+                kg = capture_anchored_graph(k, max_depth=max_depth - 1, _memo=_memo)
+                vg = capture_anchored_graph(v, max_depth=max_depth - 1, _memo=_memo)
                 pairs.append([kg, vg])
-            pairs.sort(key=lambda kv: repr(kv[0]))  # déterministe
+            pairs.sort(key=lambda kv: repr(kv[0]))  # deterministic order
             return {"$id": label, "$map": pairs}
 
     # List
     if isinstance(obj, list):
         return {
             "$id": label,
-            "$list": [capture_object_graph_v2(x, max_depth=max_depth - 1, _memo=_memo) for x in obj],
+            "$list": [capture_anchored_graph(x, max_depth=max_depth - 1, _memo=_memo) for x in obj],
         }
 
     # Tuple
     if isinstance(obj, tuple):
         return {
             "$id": label,
-            "$tuple": [capture_object_graph_v2(x, max_depth=max_depth - 1, _memo=_memo) for x in obj],
+            "$tuple": [capture_anchored_graph(x, max_depth=max_depth - 1, _memo=_memo) for x in obj],
         }
 
     # Set / FrozenSet
     if isinstance(obj, (set, frozenset)):
-        elems = [capture_object_graph_v2(x, max_depth=max_depth - 1, _memo=_memo) for x in obj]
-        elems.sort(key=repr)
+        elems = [capture_anchored_graph(x, max_depth=max_depth - 1, _memo=_memo) for x in obj]
+        elems.sort(key=repr)  # deterministic
         return {"$id": label, "$set": elems, "$frozen": isinstance(obj, frozenset)}
 
-    # Objets “custom” : on capture les attributs publics non-callables
+    # Custom objects: capture public, non-callable attributes
     node: Dict[str, Any] = {"$id": label}
     for key, value in _get_object_attributes(obj).items():
         if key.startswith("_") or callable(value):
             continue
         try:
-            node[key] = capture_object_graph_v2(value, max_depth=max_depth - 1, _memo=_memo)
+            node[key] = capture_anchored_graph(value, max_depth=max_depth - 1, _memo=_memo)
         except Exception:
             node[key] = "<_capture_error_>"
     return node
@@ -124,23 +135,74 @@ def capture_object_graph_v2(
 
 def capture_object_graph(obj: Any, *, max_depth: int = 5) -> Any:
     """
-    API *publique* (compatible tests v1) :
-      1) capture en IR v2,
-      2) projection v1 (mode 'capture') : strip $id, unwrap, conserver les {$ref}.
-         On loggue un WARNING pour toute ref devenue “orpheline” dans la vue v1.
+    Produce a *rendered graph* for `obj`, suitable for embedding in tests and logs.
+
+    Pipeline
+    --------
+    1) Capture an **anchored graph** by exploring `obj` up to `max_depth`
+       (nodes carry `$id` anchors and references may appear as `{"$ref": N}`).
+    2) Project it to a **rendered graph** in *capture* mode:
+       - drop all `$id` anchors,
+       - unwrap `$list` / `$tuple` / `$set` / `$map` markers into JSON-like shapes,
+       - **preserve** `{"$ref": N}` nodes so aliasing can still be represented
+         without anchors.
+
+    Behavior
+    --------
+    This routine is non-throwing. If the projection yields references that have no
+    surviving anchor in the rendered view, they are kept as-is and a WARNING may be
+    logged on the `pytead.graph_capture` logger. Use `capture_object_graph_checked(...)`
+    if you prefer to raise on such cases.
+
+    Parameters
+    ----------
+    obj : Any
+        The Python value to capture.
+    max_depth : int, default 5
+        Maximum traversal depth for the anchored capture. Scalars are always recorded;
+        when the limit is reached, complex values are summarized with a stable textual
+        placeholder.
+
+    Returns
+    -------
+    Any
+        A JSON-like rendered graph (dicts/lists/scalars and the special shapes
+        `{"$map": [...]}` and `{"$set": [...], "$frozen": bool}`), possibly containing
+        `{"$ref": N}` entries when aliasing was detected.
+
+    Notes
+    -----
+    - The function does not mutate `obj`.
+    - Output is deterministic (e.g., `$map` and `$set` elements are deterministically ordered).
     """
-    core = capture_object_graph_v2(obj, max_depth=max_depth)
-    return project_v2_to_v1(core, mode="capture", tuples_as_lists=False, warn_logger=_log)
+    core = capture_anchored_graph(obj, max_depth=max_depth)
+    return project_anchored_to_rendered(core, mode="capture", tuples_as_lists=False, warn_logger=_log)
+
 
 def capture_object_graph_checked(obj: Any, *, max_depth: int = 5) -> Any:
     """
-    Capture V2, puis **projette en V1 (mode 'capture')** et lève si des $ref
-    deviennent orphelines dans cette projection (cas typique : aliasing de liste/tuple).
+    Capture an anchored graph, project it to a rendered graph (capture mode),
+    and **raise** if the projection leaves any orphan `{"$ref": N}`.
+
+    Returns
+    -------
+    Any
+        The rendered graph.
+
+    Raises
+    ------
+    GraphCaptureRefToUnanchored
+        If at least one reference has no corresponding `$id` anchor after projection.
     """
-    core_v2 = capture_object_graph_v2(obj, max_depth=max_depth)
-    v1 = project_v2_to_v1(core_v2, mode="capture", tuples_as_lists=False, warn_logger=_log)
-    orphans = find_orphan_refs(v1)
+    core = capture_anchored_graph(obj, max_depth=max_depth)
+    rendered = project_anchored_to_rendered(
+        core, mode="capture", tuples_as_lists=False, warn_logger=_log
+    )
+    orphans = find_orphan_refs_in_rendered(rendered)
     if orphans:
         details = "; ".join(f"path={p} ref={rid}" for p, rid in orphans)
-        raise GraphCaptureRefToUnanchored(f"capture produced orphan $ref(s) after v1 projection: {details}")
-    return v1
+        raise GraphCaptureRefToUnanchored(
+            f"capture produced orphan $ref(s) after rendered projection: {details}"
+        )
+    return rendered
+

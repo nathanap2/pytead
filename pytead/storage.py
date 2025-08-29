@@ -154,7 +154,7 @@ class GraphJsonStorage(_BaseStorage):
             return [cls._make_json_key_safe(x) for x in obj]
         return obj
 
-    # --- aides debug locales (pas d'import supplémentaire requis) ----------------
+
     @staticmethod
     def _count_ids_refs(node: Any) -> tuple[int, int]:
         """Compte (#$id, #$ref) dans un graphe JSON-like (dict/list)."""
@@ -211,7 +211,7 @@ class GraphJsonStorage(_BaseStorage):
                 return
 
             # Metadata
-            data.setdefault("trace_schema", "pytead/v2-graph")
+            data.setdefault("trace_schema", "pytead/anchored-graph")
             data.setdefault("timestamp", datetime.utcnow().isoformat(timespec="microseconds") + "Z")
 
             # -------- Guardrail: result_graph must be locally self-anchored --------

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union, cast
 import re
 
-from .graph_capture import capture_object_graph, capture_object_graph_v2
+from .graph_capture import capture_object_graph, capture_anchored_graph
 from .storage import PickleStorage, GraphJsonStorage, _to_literal as _to_literal
 
 
@@ -649,9 +649,9 @@ def _make_entry_graph(func_fqn: str, args: tuple, kwargs: dict, result: Any, *, 
     Capture **v2** (avec $id/$ref) pour chaque racine **séparément**.
     Important : on n'utilise PAS la projection v1 ici.
     """
-    a_graph = [capture_object_graph_v2(a, max_depth=max_depth) for a in args]
-    k_graph = {k: capture_object_graph_v2(v, max_depth=max_depth) for (k, v) in kwargs.items()}
-    r_graph = capture_object_graph_v2(result, max_depth=max_depth)
+    a_graph = [capture_anchored_graph(a, max_depth=max_depth) for a in args]
+    k_graph = {k: capture_anchored_graph(v, max_depth=max_depth) for (k, v) in kwargs.items()}
+    r_graph = capture_anchored_graph(result, max_depth=max_depth)
     return {
         "trace_schema": "pytead/v2-graph",
         "timestamp": _now_iso(),

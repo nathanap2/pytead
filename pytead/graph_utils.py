@@ -1,17 +1,18 @@
 # pytead/graph_utils.py
 from __future__ import annotations
 from typing import Any, Iterable, Optional, List, Tuple, Literal
- 
+
+
+
 __all__ = [
     "collect_anchor_ids",
     "iter_bare_refs_with_paths",
-    "find_orphan_refs",
+    "find_orphan_refs_in_rendered",
     "find_local_orphan_refs",
     "find_id_paths",
     "validate_graph",
-    "inline_and_project_expected"
-    ]
-
+    "project_anchored_to_rendered",
+]
 
 import logging
 from .normalize import sanitize_for_py_literals
@@ -105,7 +106,7 @@ def _unwrap_v2(node: Any, *, tuples_as_lists: bool) -> Any:
         return elems if tuples_as_lists else tuple(elems)
     return node
 
-def project_v2_to_v1(
+def project_anchored_to_rendered(
     node: Any,
     *,
     mode: Literal["capture","expected"] = "capture",
@@ -114,14 +115,12 @@ def project_v2_to_v1(
     warn_logger: Optional[logging.Logger] = None,
 ) -> Any:
     """
-    Projette une IR v2 (avec $id/$list/$tuple/$set/$map) en "v1":
-      - suppression systématique de $id,
-      - dé-wrapping des listes/tuples (tuples→listes si tuples_as_lists=True),
-      - conservation de {"$ref": N} (mode "capture"); on loggue un WARNING car en v1
-        il n'existe plus d'ancres $id locales,
-      - mode "expected": on part du principe que les refs externes ont été **inlinées**
-        en amont; on conserve les refs restantes (s’il y en a, c’est une vraie anomalie
-        et la génération lèvera après coup).
+    Projection **Anchored → Rendered** :
+      - supprime systématiquement les `$id`,
+      - dé-wrappe `$list`/`$tuple`/`$set`/`$map` (tuples→listes si `tuples_as_lists=True`),
+      - en mode `"capture"`, conserve `{"$ref": N}` (warning possible si plus d’ancre locale),
+      - en mode `"expected"`, on suppose les refs **externes** déjà inlinées ; toute ref restante
+        sera signalée par la génération / validation en aval.
     """
 
     def _dec(n: Any) -> Any:
@@ -252,26 +251,61 @@ def iter_bare_refs_with_paths(node, path: str = "$"):
         for i, e in enumerate(node):
             yield from iter_bare_refs_with_paths(e, f"{path}[{i}]")
 
-def find_orphan_refs(
+def find_orphan_refs_in_rendered(
     expected_graph: Any,
     donors_graphs: Iterable[Any] | None = None,
 ) -> list[tuple[str, int]]:
     """
-    Renvoie la liste [(json_path, ref_id)] des {'$ref': N} présents dans
-    `expected_graph` **dont N n'apparaît comme $id dans aucun des donneurs** (ni dans expected).
-    Les donneurs typiques sont args_graph et kwargs_graph.
+    Return a list of (json_path, ref_id) for every {"$ref": N} found in a *rendered graph*
+    (i.e., a graph where "$id" anchors were stripped) that does not have a corresponding
+    "$id" anchor either in the rendered graph itself or in any of the donor graphs.
+
+    Parameters
+    ----------
+    expected_graph : Any
+        The rendered graph to validate (typically the "expected" snapshot after projection).
+        By convention rendered graphs should not carry "$id" anchors; this function is robust
+        if they do.
+    donors_graphs : Iterable[Any] | None
+        Optional graphs that may contain anchors to satisfy references present in the rendered
+        graph. In practice, these are usually the *anchored* `args_graph` and `kwargs_graph`
+        captured at trace time. If donors are already rendered, they simply won't contribute
+        any anchors.
+
+    Returns
+    -------
+    list[tuple[str, int]]
+        A list of (json_path, ref_id) pairs, one for each orphan reference. `json_path` is a
+        stable JSONPath-like string pointing to the exact location of the `{"$ref": N}` node.
+
+    Notes
+    -----
+    - This is a *pure* check: it does not mutate its inputs.
+    - Traversal covers plain dict/list as well as special shapes: {"$map": [...]}, {"$set": [...]}
+      produced by the anchored -> rendered projection.
+    - Complexity is O(size(graphs)).
+
+    Examples
+    --------
+    If expected_graph contains {"base": {"$ref": 3}} and no donor provides an anchor
+    node with "$id": 3, the function returns [("$.base", 3)].
     """
     ids: set[int] = set()
+
+    # Collect anchors from donors first (args/kwargs/self graphs captured in anchored form)
     for g in donors_graphs or ():
         collect_anchor_ids(g, ids)
-    # ancres internes de expected : légitimes
+
+    # Also consider anchors that might still be present inside the rendered graph
     collect_anchor_ids(expected_graph, ids)
 
+    # Any bare ref whose id is not in the collected anchors is an orphan
     out: list[tuple[str, int]] = []
-    for (p, rid) in iter_bare_refs_with_paths(expected_graph):
+    for (path, rid) in iter_bare_refs_with_paths(expected_graph):
         if rid not in ids:
-            out.append((p, rid))
+            out.append((path, rid))
     return out
+
 
 def validate_graph(graph: Any) -> List[str]:
     """
@@ -411,7 +445,7 @@ def inline_and_project_expected(
     inlined = _inline_external_refs_in_expected(result_graph, donor_index)
 
     # (2) Orphelines après inlining (donneurs = args/kwargs; expected compte aussi)
-    orphans = find_orphan_refs(inlined, donors_graphs=[args_graph, kwargs_graph])
+    orphans = find_orphan_refs_in_rendered(inlined, donors_graphs=[args_graph, kwargs_graph])
     if orphans:
         try:
             txt = ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
@@ -428,8 +462,59 @@ def inline_and_project_expected(
             f"Found {len(orphans)} orphan ref(s): {details}"
         )
 
-    # (3) Projection v2→v1 (strip $id; tuples→listes selon option)
-    projected = project_v2_to_v1(inlined, mode="expected", tuples_as_lists=tuples_as_lists)
+    # (3) Dé-aliasser toutes les refs (internes ET externes) *avant* projection,
+    #     en reproduisant exactement l’ancienne sémantique (cycle-safe).
+    anchor: dict[int, Any] = {}
+    def _collect(node: Any) -> None:
+        if isinstance(node, dict):
+            rid = node.get("$id")
+            if isinstance(rid, int):
+                anchor[rid] = node
+            for v in node.values():
+                _collect(v)
+        elif isinstance(node, (list, tuple)):
+            for v in node:
+                _collect(v)
+    _collect(args_graph); _collect(kwargs_graph); _collect(inlined)
 
-    # (4) Normalisation littéraux Python
+    INPROGRESS = object()
+    memo: dict[int, Any] = {}
+    def _resolve_ref_id(rid: int, path: str) -> Any:
+        if rid in memo:
+            val = memo[rid]
+            return {} if val is INPROGRESS else val
+        tgt = anchor.get(rid)
+        memo[rid] = INPROGRESS
+        val = _mat(tgt, path)
+        memo[rid] = val
+        return val
+
+    def _mat(node: Any, path: str = "$") -> Any:
+        if isinstance(node, dict):
+            # ref pure
+            if set(node.keys()) == {"$ref"} and isinstance(node["$ref"], int):
+                return _resolve_ref_id(node["$ref"], path)
+            # $list (forme v2)
+            if "$list" in node and isinstance(node["$list"], list):
+                return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node["$list"])]
+            # dict “normal” : strip $id et descente
+            out: dict[str, Any] = {}
+            for k, v in node.items():
+                if k in ("$id", "$list"):
+                    continue
+                child = f"{path}.{k}" if path != "$" else f"$.{k}"
+                out[k] = _mat(v, child)
+            return out
+        if isinstance(node, list):
+            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
+        if isinstance(node, tuple):
+            return [_mat(x, f"{path}[{i}]") for i, x in enumerate(node)]
+        return node
+
+    expanded = _mat(inlined, "$")
+
+    # (4) Projection
+    projected = project_anchored_to_rendered(expanded, mode="expected", tuples_as_lists=tuples_as_lists)
+
+    # (5) Normalisation littéraux Python
     return sanitize_for_py_literals(projected)
