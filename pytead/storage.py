@@ -7,7 +7,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Callable, IO
 
-from .typing_defs import StorageLike, TraceEntry
+from .typing_defs import (
+    StorageLike,
+    TraceEntry,
+    coerce_entry_shapes,
+    basic_entry_invariants_ok,
+)
 
 from datetime import datetime
 from dataclasses import asdict
@@ -315,21 +320,15 @@ def iter_entries(
     calls_dir: Path, formats: Optional[List[str]] = None
 ) -> Iterable[TraceEntry]:
     for st in storages_from_names(formats):
-        for p in sorted(calls_dir.glob(f"*{st.extension}")):
-            try:
+         for p in sorted(calls_dir.glob(f"*{st.extension}")):
+             try:
                 entry = st.load(p)
-            except Exception as exc:
-                log.warning("Skipping corrupt trace %s: %s", p, exc)
-                continue
-            if "func" not in entry:
-                log.warning("Skipping trace without 'func': %s", p)
-                continue
-            args = entry.get("args", ())
-            if not isinstance(args, tuple):
-                try:
-                    args = tuple(args)
-                except Exception:
-                    pass
-            entry["args"] = args  # type: ignore[index]
-            entry["kwargs"] = entry.get("kwargs", {}) or {}  # type: ignore[index]
-            yield entry  # type: ignore[misc]
+             except Exception as exc:
+                 log.warning("Skipping corrupt trace %s: %s", p, exc)
+                 continue
+             # Normalize shapes (args tuple, kwargs dict) and run a cheap invariant gate
+             entry = coerce_entry_shapes(entry)
+             if not basic_entry_invariants_ok(entry):
+                 log.warning("Skipping invalid trace %s", p)
+                 continue
+             yield entry  # Iterable[TraceEntry]

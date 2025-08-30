@@ -8,19 +8,15 @@ from typing import Iterable, List, Optional
 
 from ..errors import PyteadError
 from ..logconf import configure_logger
-from ._cli_utils import split_targets_and_cmd, fallback_targets_from_cfg
+from ._cli_utils import (
+    split_targets_and_cmd,
+    fallback_targets_from_cfg,
+    first_py_token,
+    require_script_py_or_exit,
+)
 from .config_cli import load_layered_config, apply_effective_to_args, effective_section
 from . import service_cli as svc  # couche services dans le même paquet CLI
 
-
-def _first_py(tokens: Iterable[str] | None) -> Optional[Path]:
-    for t in tokens or []:
-        if isinstance(t, str) and t.endswith(".py"):
-            try:
-                return Path(t).resolve()
-            except Exception:
-                return Path(t)
-    return None
 
 
 def _require_fields(args: argparse.Namespace, names: list[str], logger) -> None:
@@ -41,7 +37,7 @@ def _handle(args: argparse.Namespace) -> None:
     log = configure_logger(name="pytead.cli.run")
 
     # Prefer discovering config from the script directory if provided
-    start_hint = _first_py(getattr(args, "cmd", None))
+    start_hint = first_py_token(getattr(args, "cmd", None))
     ctx = load_layered_config(start=start_hint)
     apply_effective_to_args("run", ctx, args)
 
@@ -74,8 +70,7 @@ def _handle(args: argparse.Namespace) -> None:
     if not isinstance(script, str) or not script.endswith(".py"):
         log.error("Unsupported script '%s': only .py files are allowed", script)
         sys.exit(1)
-    script_path = _first_py([script])
-    assert script_path is not None
+    script_path = require_script_py_or_exit(cmd, log)
 
     # Additional import roots:
     # Keep them as given (possibly relative). compute_import_roots will anchor them on project root.

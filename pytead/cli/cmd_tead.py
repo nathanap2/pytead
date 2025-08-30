@@ -12,7 +12,10 @@ from .config_cli import (
     apply_effective_to_args,
     effective_section,
 )
+
 from ._cli_utils import split_targets_and_cmd, fallback_targets_from_cfg, unique_count
+from ._cli_utils import first_py_token as _first_py_token, resolve_under, require_script_py_or_exit
+
 from ..logconf import configure_logger
 from ..storage import get_storage
 from ..imports import prepend_sys_path
@@ -20,7 +23,7 @@ from ..gen_tests import collect_entries, render_tests, write_tests, write_tests_
 from ..targets import instrument_targets, resolve_target
 from ..rt import resolve_attr
 from ..tracing import trace as trace_decorator
-from ._cli_utils import first_py_token as _first_py_token, resolve_under
+
 
 
 
@@ -175,10 +178,8 @@ def run(args: argparse.Namespace) -> None:
                 log.warning("Defensive re-wrap failed for %s: %r", fqn, exc)
 
     # --- 7) Exécution du script
-    script = cmd[0]
-    if not isinstance(script, str) or not script.endswith(".py"):
-        log.error("Unsupported script '%s': only .py files are allowed", script)
-        sys.exit(1)
+    script_path = require_script_py_or_exit(cmd, log)
+    script = str(script_path)
 
     sys.argv = cmd
     try:

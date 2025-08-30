@@ -25,6 +25,7 @@ from .errors import GenerationError, OrphanRefInExpected
 from .graph_utils import find_orphan_refs_in_rendered, inline_and_project_expected
 from ._cases import unique_cases, render_case, case_id
 
+from .typing_defs import TraceEntry, is_graph_entry
 
 
 __all__ = ["collect_entries", "render_tests", "write_tests", "write_tests_per_func"]
@@ -614,7 +615,7 @@ def _temporarily_prepend_sys_path(roots: list[str]):
 
 
 def write_tests_per_func(
-    entries_by_func: Dict[str, List[Dict[str, Any]]],
+    entries_by_func: Dict[str, List[TraceEntry]],
     output_dir: Union[str, Path],
     import_roots: Optional[List[Union[str, Path]]] = None,
 ) -> None:
@@ -647,7 +648,7 @@ def write_tests_per_func(
         sample_trace = entries[0]
         module_sanitized = func_fullname.replace(".", "_")
 
-        if "args_graph" in sample_trace:
+        if is_graph_entry(sample_trace):
             filename = f"test_{module_sanitized}_snapshots.py"
 
             # Prepare sys.path for the generator process to make module resolution stable.
@@ -708,11 +709,11 @@ def write_tests_per_func(
 
             source = "\n".join(bootstrap_lines + import_lines) + "\n\n" + "\n\n".join(test_functions) + "\n"
             (out_path / filename).write_text(source, encoding="utf-8")
-
+            
         else:
-            # State-based (pickle): single parameterized module aggregating cases
+            # State-based (pickle): single parameterized module (one function)
             filename = f"test_{module_sanitized}.py"
-            source = _render_legacy_tests({func_fullname: entries}, import_roots=resolved_roots)
+            source = render_state_tests({func_fullname: entries}, import_roots=resolved_roots)
             (out_path / filename).write_text(
                 source + ("" if source.endswith("\n") else "\n"),
                 encoding="utf-8",
@@ -724,14 +725,14 @@ def write_tests_per_func(
 
 def collect_entries(
     storage_dir: Union[str, Path], formats: Optional[List[str]] = None
-) -> Dict[str, List[Dict[str, Any]]]:
+) -> Dict[str, List[TraceEntry]]:
     """
     Group trace entries by function FQN from a calls directory.
     """
     path = Path(storage_dir)
     if not path.exists() or not path.is_dir():
         raise ValueError(f"Calls directory '{storage_dir}' does not exist or is not a directory")
-    entries_by_func: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    entries_by_func: Dict[str, List[TraceEntry]] = defaultdict(list)
     for entry in iter_entries(path, formats=formats):
         func = entry.get("func")
         if not func:
@@ -741,18 +742,42 @@ def collect_entries(
     return dict(entries_by_func)
 
 
+
 def render_tests(
-    entries_by_func: Dict[str, List[Dict[str, Any]]],
+    entries_by_func: Dict[str, List[TraceEntry]],
     import_roots: Optional[List[Union[str, Path]]] = None,
 ) -> str:
-    """If pickle → return a single module; if graph-json → instruct per-function mode."""
+    """
+    Render a single Python test module from a collection of trace entries.
+
+    Behavior:
+    - For state-based ("pickle") traces, return a full pytest module that aggregates
+      all functions using parameterized tests (via `render_state_tests`), bootstrapping
+      the provided `import_roots`.
+    - For graph-based ("graph-json") traces, this helper does not inline tests into a
+      single file. Graph snapshot tests are generated one file per target for clarity
+      and isolation (see `write_tests_per_func`). In that case, a short sentinel
+      source string is returned.
+    - If the mapping is empty or contains only empty lists, return an empty string.
+    """
     if not entries_by_func:
         return ""
-    sample_trace = next(iter(entries_by_func.values()))[0]
-    if "args_graph" not in sample_trace:
-        return render_state_tests(entries_by_func, import_roots=import_roots or [])
-    return "# Graph snapshot tests are generated one per file. Use --output-dir."
 
+    # Find the first non-empty entry list, if any.
+    sample_trace: Optional[TraceEntry] = None
+    for entries in entries_by_func.values():
+        if entries:
+            sample_trace = entries[0]
+            break
+    if sample_trace is None:
+        return ""
+
+    # Decide rendering strategy based on the sample's format.
+    if is_graph_entry(sample_trace):
+        return "# Graph snapshot tests are generated one per file. Use --output-dir."
+
+    # State-based (pickle): aggregate into a single module.
+    return render_state_tests(entries_by_func, import_roots=import_roots or [])
 
 
 def write_tests(source: str, output_file: Union[str, Path]) -> None:
