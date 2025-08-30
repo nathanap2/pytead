@@ -4,7 +4,7 @@ storage_dir = "call_logs"
 format = "graph-json"
 
 [run]
-limit = 7
+limit = 2
 
 [gen]
 output_dir = "tests/generated"
@@ -12,3 +12,7 @@ output_dir = "tests/generated"
 [types]
 storage_dir = "call_logs"
 out_dir = "typings"
+
+[tead]
+limit = 2
+output_dir = "tests/generated"

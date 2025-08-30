@@ -58,7 +58,6 @@ def test_graphjson_generates_correct_import_for_methods_with_sys_path_append(tmp
     res = svc.collect_and_emit_tests(
         storage_dir=calls_dir,
         formats=None,
-        output=None,
         output_dir=out_dir,
         import_roots=[str(project)],
     )
@@ -68,7 +67,6 @@ def test_graphjson_generates_correct_import_for_methods_with_sys_path_append(tmp
     assert snapshot_files, "No snapshot test module was generated."
     src = snapshot_files[0].read_text(encoding="utf-8")
 
-    # ✅ Après patch, on attend la bonne forme d'import pour une méthode :
     assert "from world import BaseEntity" in src
     assert "from world.BaseEntity import get_coordinates" not in src
 

@@ -23,7 +23,8 @@ classifiers = [
 keywords = ["testing", "pytest", "tracing", "automation"]
 dependencies = [
   "tomli; python_version < '3.11'",
-  "pyyaml>=6.0"
+  "pyyaml>=6.0",
+  "wrapt>=1.15"
 ]
 
 [project.scripts]

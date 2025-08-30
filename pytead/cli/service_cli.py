@@ -159,30 +159,45 @@ def collect_traces(
 def emit_tests(
     entries_by_func: Dict[str, List[Dict[str, Any]]],
     *,
-    output: Optional[Path] = None,
-    output_dir: Optional[Path] = None,
+    output_dir: Path,
     import_roots: Optional[List[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> GenerationResult:
     """
-    Render and write tests (either a single file or one file per function).
-    Exactly one of `output` or `output_dir` must be provided.
+    Write one test module per function into `output_dir`.
+
+    Parameters
+    ----------
+    entries_by_func : Dict[str, List[Dict[str, Any]]]
+        Collected trace entries grouped by fully-qualified function name.
+    output_dir : Path
+        Destination directory where one test file per function will be written.
+    import_roots : Optional[List[str]]
+        Absolute import roots to embed into generated test files so that user
+        modules can be imported reliably in the test environment.
+    logger : Optional[logging.Logger]
+        Optional logger for progress messages.
+
+    Returns
+    -------
+    GenerationResult
+        Summary with number of files written, unique cases count, and the output directory.
     """
-    assert (output is None) ^ (output_dir is None), "Provide exactly one of output or output_dir"
-
+    # Count unique cases across all functions (graph-json and pickle handled upstream).
     uniq = unique_count(entries_by_func)
-    if output_dir is not None:
-        write_tests_per_func(entries_by_func, output_dir, import_roots=import_roots)
-        if logger:
-            logger.info("Wrote %d test module(s) into '%s'.", len(entries_by_func), output_dir)
-        return GenerationResult(files_written=len(entries_by_func), unique_cases=uniq, output_dir=output_dir)
 
-    source = render_tests(entries_by_func, import_roots=import_roots)
-    assert output is not None
-    write_tests(source, output)
+    # Write one file per function. The writer creates the directory if needed.
+    write_tests_per_func(entries_by_func, output_dir, import_roots=import_roots)
+
     if logger:
-        logger.info("Wrote test file '%s' with %d unique cases.", output, uniq)
-    return GenerationResult(files_written=1, unique_cases=uniq, output=output)
+        logger.info("Wrote %d test module(s) into '%s'.", len(entries_by_func), output_dir)
+
+    return GenerationResult(
+        files_written=len(entries_by_func),
+        unique_cases=uniq,
+        output_dir=output_dir,
+    )
+
 
 
 # ---------- Composed services used by commands ----------
@@ -212,27 +227,36 @@ def collect_and_emit_tests(
     *,
     storage_dir: Path,
     formats: Optional[List[str]],
-    output: Optional[Path],
     output_dir: Optional[Path],
     import_roots: Optional[List[str]] = None,
     only_targets: Optional[Iterable[str]] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Optional[GenerationResult]:
     """
-    1) Collect traces, 2) optionally filter by targets, 3) write tests.
-    Returns GenerationResult or None if nothing was written.
+    1) Collect traces from `storage_dir`,
+    2) optionally filter by `only_targets`,
+    3) emit tests one file per function into `output_dir`.
+
+    Returns
+    -------
+    Optional[GenerationResult]
+        A summary if something was written; None if nothing to do (no traces, or
+        filtered out), or if the storage directory does not exist.
     """
+    # Precondition: storage directory must exist.
     if not storage_dir.exists():
         if logger:
             logger.info("Storage dir '%s' does not exist — skipping generation.", storage_dir)
         return None
 
+    # Load traces (grouped by fully-qualified function name).
     entries = collect_traces(storage_dir, formats, logger=logger)
     if not entries:
         if logger:
             logger.warning("No traces found in '%s'.", storage_dir)
         return None
 
+    # Optional filtering by a subset of targets.
     if only_targets:
         tgt = set(only_targets)
         entries = {k: v for (k, v) in entries.items() if k in tgt}
@@ -241,11 +265,16 @@ def collect_and_emit_tests(
                 logger.warning("Traces exist but none match targets: %s", sorted(tgt))
             return None
 
+    # No implicit defaults here: the caller must provide output_dir.
+    if output_dir is None:
+        raise ValueError("collect_and_emit_tests: 'output_dir' must be provided by the caller (see config).")
+
+    # Emit one test file per function.
     return emit_tests(
-        entries,
-        output=output,
+        entries_by_func=entries,
         output_dir=output_dir,
         import_roots=import_roots,
         logger=logger,
     )
+
 

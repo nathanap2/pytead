@@ -2,57 +2,47 @@
 from __future__ import annotations
 
 import argparse
-import runpy
 import sys
 from pathlib import Path
 from typing import Optional, List
 
-from .config_cli import (
-    load_layered_config,
-    apply_effective_to_args,
-    effective_section,
+from .config_cli import load_layered_config, apply_effective_to_args, effective_section
+from ._cli_utils import (
+    split_targets_and_cmd,
+    fallback_targets_from_cfg,
+)
+from ._cli_utils import (
+    first_py_token as _first_py_token,
+    resolve_under,
+    require_script_py_or_exit,
 )
 
-from ._cli_utils import split_targets_and_cmd, fallback_targets_from_cfg, unique_count
-from ._cli_utils import first_py_token as _first_py_token, resolve_under, require_script_py_or_exit
-
 from ..logconf import configure_logger
-from ..storage import get_storage
-from ..imports import prepend_sys_path
-from ..gen_tests import collect_entries, render_tests, write_tests, write_tests_per_func
-from ..targets import instrument_targets, resolve_target
-from ..rt import resolve_attr
-from ..tracing import trace as trace_decorator
-
-
-
+from . import service_cli as svc
 
 
 def _project_root_from_config_source(src: Optional[Path]) -> Optional[Path]:
+    """
+    Si la config projet provient de '<root>/.pytead/config.*', remonte d'un cran
+    pour obtenir la racine projet; sinon retourne le dossier de la config.
+    """
     if not src:
         return None
     cfg_dir = src.parent
     return cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
 
 
-def _peek_wrapped_status(log, fqn: str) -> tuple[bool, str]:
-    try:
-        obj = resolve_attr(fqn)
-    except Exception as exc:
-        return False, f"resolve_attr({fqn!r}) failed: {exc!r}"
-    base = getattr(obj, "__func__", obj)
-    is_wrapped = hasattr(base, "__wrapped__")
-    mod_name = fqn.rsplit(".", 1)[0]
-    try:
-        import importlib
-        mod = importlib.import_module(mod_name)
-        file_hint = getattr(mod, "__file__", None)
-    except Exception:
-        file_hint = None
-    return is_wrapped, f"wrapped={is_wrapped} module={mod_name!r} file={file_hint!r} obj_id={id(base)}"
-
-
 def run(args: argparse.Namespace) -> None:
+    """
+    Implémentation de `pytead tead` :
+      - charge la config en couches et applique les valeurs effectives,
+      - résout cibles + script,
+      - délègue instrumentation + exécution à la couche services,
+      - génère les tests depuis les traces collectées.
+
+    La logique est volontairement mince; toute la “vraie” mécanique vit dans
+    pytead/cli/service_cli.py.
+    """
     log = configure_logger(name="pytead.tead")
 
     # --- 0) Positionnels
@@ -84,7 +74,7 @@ def run(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    # --- 3) Cibles
+    # --- 3) Cibles (CLI → fallback config [tead] puis [run])
     eff_tead = effective_section(ctx, "tead")
     eff_run = effective_section(ctx, "run")
 
@@ -100,7 +90,7 @@ def run(args: argparse.Namespace) -> None:
         log.error("No script specified after '--'")
         sys.exit(1)
 
-    # --- 4) Racine & répertoire de traces
+    # --- 4) Racine & répertoire de traces (ancrés)
     project_root = (
         _project_root_from_config_source(ctx.source_path)
         or (script_from_cmd.parent if script_from_cmd else None)
@@ -115,108 +105,70 @@ def run(args: argparse.Namespace) -> None:
     log.info("Project root: %s", project_root)
     log.info("Storage dir : %s", storage_dir_abs)
 
-    # --- 5) Environnement d'import
-    roots: List[str] = []
-    if script_from_cmd:
-        roots.append(str(script_from_cmd.parent.resolve()))
-    if project_root:
-        roots.append(str(project_root.resolve()))
+    # --- 5) Chemins d'import supplémentaires (relatifs ancrés sur project_root)
     extra_paths = (
         getattr(args, "additional_sys_path", None)
         or (eff_tead or {}).get("additional_sys_path")
         or (eff_run or {}).get("additional_sys_path")
         or []
     )
+    add_paths: List[Path] = []
     for p in extra_paths:
         pp = Path(p)
-        roots.append(
-            str((project_root / pp).resolve()) if not pp.is_absolute() else str(pp.resolve())
-        )
-    seen = set(); ordered = []
-    for r in roots:
-        if r not in seen:
-            seen.add(r); ordered.append(r)
-    prepend_sys_path(ordered)
-    log.info("Import roots: %s", ordered)
+        add_paths.append(pp if pp.is_absolute() else (project_root / pp))
 
-    # --- 6) Instrumentation
-    storage = get_storage(getattr(args, "format"))
+    # --- 6) Instrumentation + exécution via service layer
+    script_path = require_script_py_or_exit(cmd, log)
     try:
-        seen_targets = instrument_targets(
-            targets, limit=getattr(args, "limit"), storage_dir=storage_dir_abs, storage=storage
+        instr, outcome, roots = svc.instrument_and_run(
+            targets=targets,
+            limit=getattr(args, "limit"),
+            storage_dir=storage_dir_abs,
+            storage=getattr(args, "format"),
+            script_file=script_path,
+            argv=cmd,
+            additional_sys_path=add_paths,
+            logger=log,
         )
     except Exception as exc:
-        for line in str(exc).splitlines():
-            log.error(line)
+        log.error("TEAD failed during instrument+run: %s", exc)
         sys.exit(1)
+
     log.info(
         "Instrumentation applied to %d target(s): %s",
-        len(seen_targets),
-        ", ".join(sorted(seen_targets)),
+        len(instr.seen),
+        ", ".join(sorted(instr.seen)),
     )
-
-    # 🔎 Toujours logger le pré-check; rewrap défensif si besoin
-    for fqn in sorted(seen_targets):
-        ok, diag = _peek_wrapped_status(log, fqn)
-        log.info("Pre-run check %s → %s", fqn, diag)
-        if not ok:
-            try:
-                rt = resolve_target(fqn)
-                installed = getattr(rt.owner, rt.attr)
-                base = getattr(installed, "__func__", installed)
-                if not hasattr(base, "__wrapped__"):
-                    wrapped = trace_decorator(
-                        limit=getattr(args, "limit"),
-                        storage_dir=storage_dir_abs,
-                        storage=storage,
-                    )(base)
-                    setattr(rt.owner, rt.attr, wrapped)
-                    log.info("Defensive re-wrap applied to %s", fqn)
-                ok2, diag2 = _peek_wrapped_status(log, fqn)
-                log.info("Post-defensive check %s → %s", fqn, diag2)
-            except Exception as exc:
-                log.warning("Defensive re-wrap failed for %s: %r", fqn, exc)
-
-    # --- 7) Exécution du script
-    script_path = require_script_py_or_exit(cmd, log)
-    script = str(script_path)
-
-    sys.argv = cmd
-    try:
-        runpy.run_path(script, run_name="__main__")
-        log.info("Script run completed: %s", script)
-    except SystemExit as exc:
-        log.info("Target script exited with SystemExit(%s) — continuing to generation.", getattr(exc, "code", 0))
-    except KeyboardInterrupt:
-        log.warning("Target script interrupted (KeyboardInterrupt) — continuing to generation.")
-    except BaseException as exc:
-        log.error("Target script terminated: %r — continuing to generation.", exc)
-
-    # --- 8) Génération — chemins ancrés sur project_root
-    out_file = getattr(args, "output", None)
-    out_dir = getattr(args, "output_dir", None)
-    if out_file is None and out_dir is None:
-        out_file = project_root / "tests" / "test_pytead_generated.py"
+    if outcome.status.name == "OK":
+        log.info("Script run completed successfully.")
+    elif outcome.status.name == "SYSTEM_EXIT":
+        log.info("Script exited with code %s.", outcome.exit_code)
+    elif outcome.status.name == "KEYBOARD_INTERRUPT":
+        log.warning("Script interrupted (KeyboardInterrupt).")
     else:
-        out_file = resolve_under(project_root, out_file)
-        out_dir = resolve_under(project_root, out_dir)
-        
-    gen_formats = getattr(args, "gen_formats", None)
-    only_targets = sorted(seen_targets) if getattr(args, "only_targets", False) else None
-    import_roots = ordered  # déjà calculé plus haut
+        log.error("Script terminated abnormally: %s", outcome.detail or "unknown error")
 
-    from .service_cli import collect_and_emit_tests
-    res = collect_and_emit_tests(
+    # --- 7) Génération — chemins ancrés sur project_root
+    out_dir = args.output_dir
+    out_dir = resolve_under(project_root, out_dir)
+        
+
+    gen_formats = getattr(args, "gen_formats", None)
+    only_targets = sorted(instr.seen) if getattr(args, "only_targets", False) else None
+    res = svc.collect_and_emit_tests(
         storage_dir=storage_dir_abs,
         formats=gen_formats,
-        output=out_file,
         output_dir=out_dir,
-        import_roots=import_roots,
+        import_roots=roots,  # racines réellement utilisées pendant l'exécution
         only_targets=only_targets,
         logger=log,
     )
     if res:
-        log.info("Generated %d unique case(s) across %d file(s).", res.unique_cases, res.files_written)
+        log.info(
+            "Generated %d unique case(s) across %d file(s).",
+            res.unique_cases,
+            res.files_written,
+        )
     else:
         log.warning("No tests generated (no traces or filter excluded everything).")
 
@@ -229,9 +181,7 @@ def add_tead_subparser(subparsers) -> None:
     p.add_argument("--gen-formats", choices=["pickle", "graph-json"], nargs="*", default=argparse.SUPPRESS)
 
     p.add_argument("--only-targets", action="store_true", default=argparse.SUPPRESS)
-    grp = p.add_mutually_exclusive_group()
-    grp.add_argument("-o", "--output", type=Path, default=argparse.SUPPRESS)
-    grp.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS)
+    p.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS)
     p.add_argument("--additional-sys-path", dest="additional_sys_path", nargs="*", default=argparse.SUPPRESS)
     p.add_argument("targets", nargs="*", default=argparse.SUPPRESS)
     p.add_argument("cmd", nargs=argparse.REMAINDER)

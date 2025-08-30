@@ -227,7 +227,7 @@ def test_snapshot_generation_with_complex_imports_and_formatting(tmp_path: Path)
     try:
         result = collect_and_emit_tests(
             storage_dir=storage_dir, formats=["graph-json"],
-            output=None, output_dir=output_dir,
+            output_dir=output_dir,
             import_roots=import_roots, logger=None
         )
     finally:

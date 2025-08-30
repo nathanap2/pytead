@@ -26,31 +26,6 @@ def is_wrapped(obj):
     return inspect.unwrap(obj) is not obj
 
 
-def test_tead_debug_wrapped_status(tmp_path, caplog):
-    caplog.set_level(logging.INFO, logger="pytead")
-    (tmp_path / ".pytead").mkdir()
-    (tmp_path / ".pytead" / "config.toml").write_text(
-        "[defaults]\nlimit=1\nstorage_dir='call_logs'\nformat='pickle'\n"
-        "[tead]\ntargets=['sm_mod.render_json']\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "sm_mod.py").write_text(
-        "def render_json(x): return x\n", encoding="utf-8"
-    )
-    (tmp_path / "main.py").write_text(
-        "from sm_mod import render_json; render_json(1)\n", encoding="utf-8"
-    )
-
-    from types import SimpleNamespace
-    from pytead.cli.cmd_tead import run as tead_run
-
-    # simulate 'pytead tead -- main.py'
-    args = SimpleNamespace(targets=[str(tmp_path / "main.py")], cmd=[])
-    tead_run(args)
-
-    msg = "\n".join(r.getMessage() for r in caplog.records)
-    assert "Pre-run check sm_mod.render_json" in msg
-    assert "Storage dir" in msg
 
 
 # -------- 1) TEAD smoke : découvre config même si script dans targets ----------
