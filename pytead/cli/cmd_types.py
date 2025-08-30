@@ -4,193 +4,139 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
 
 from ..logconf import configure_logger
-from .config_cli import load_layered_config, apply_effective_to_args, effective_section
+from .config_cli import (
+    load_layered_config,
+    apply_effective_to_args,
+    effective_section,
+    resolve_under_project_root,
+)
+from ._cli_utils import ensure_storage_dir_or_exit
 from ..gen_tests import collect_entries
 from .._cases import unique_cases
 from ..gen_types import summarize_function_types, group_by_module, render_stub_module
 
 
-def _as_path(x) -> Path | None:
-    if x is None:
-        return None
-    return Path(x)
+log = configure_logger(name="pytead.cli.types")
 
 
-def _resolve_under(root: Path, p: Path | None) -> Path | None:
-    """Return absolute path under `root` when `p` is relative; passthrough if absolute/None."""
-    if p is None:
-        return None
-    return p if p.is_absolute() else (root / p)
+def _module_to_rel_path(module: str) -> Path:
+    """Convert dotted module name to a relative path (no suffix)."""
+    return Path(*module.split("."))
 
 
-def _detect_project_root(ctx, explicit: Path | None) -> Path:
+def _handle(args: argparse.Namespace) -> None:
     """
-    Decide a stable project root:
-    - if user passed --project-root, prefer it,
-    - else use the root discovered by the layered config (ctx.project_root),
-    - fallback to CWD.
-    """
-    if explicit is not None:
-        return explicit.resolve()
-    if getattr(ctx, "project_root", None):
-        try:
-            return Path(ctx.project_root).resolve()
-        except Exception:
-            pass
-    return Path.cwd().resolve()
+    Read recorded traces and emit `.pyi` stubs grouped by module.
 
+    Policy:
+      - CLI overrides layered config ([types]).
+      - storage_dir is validated with detailed diagnostics.
+      - output_dir is required (CLI or [types].out_dir) and anchored on project_root.
+      - Minimal logic here; heavy lifting is delegated to core libs.
+    """
+    # Optional hint for config discovery and path anchoring
+    explicit_root = getattr(args, "project_root", None)
+    ctx = load_layered_config(start=explicit_root)
 
-def _load_effective_types_config(args: argparse.Namespace, start: Path | None):
-    """
-    Load layered config and fill args fields that are missing. Then read the effective
-    [types] section so we can map storage_dir -> out_dir defaults.
-    """
-    ctx = load_layered_config(start=start)
+    # Fill args from effective [types]; keep CLI precedence
     apply_effective_to_args("types", ctx, args)
-    eff_types = effective_section(ctx, "types")
-    return ctx, eff_types
+    eff_types: Dict = effective_section(ctx, "types") or {}
 
+    # --- Resolve/validate storage dir (reuses common helper with rich diagnostics)
+    storage_dir = ensure_storage_dir_or_exit(ctx, "types", getattr(args, "storage_dir", None), log)
 
-def _finalize_io_paths(project_root: Path, storage_dir: Path | None, out_dir: Path | None, eff_types: dict):
-    """
-    Resolve storage_dir/out_dir using CLI overrides, effective config, and project_root anchoring.
-    """
-    if storage_dir is None:
-        cfg_calls = eff_types.get("storage_dir")
-        storage_dir = _as_path(cfg_calls)
+    # --- Resolve output directory (required)
+    out_dir = getattr(args, "output_dir", None) or eff_types.get("out_dir")
     if out_dir is None:
-        cfg_out = eff_types.get("out_dir")
-        out_dir = _as_path(cfg_out)
-    storage_dir = _resolve_under(project_root, storage_dir) if storage_dir else None
-    out_dir = _resolve_under(project_root, out_dir) if out_dir else None
-    return storage_dir, out_dir
-
-
-def _require(cond: bool, log, msg: str) -> None:
-    if not cond:
-        log.error(msg)
+        log.error("`pytead types` requires --output-dir or [types].out_dir in config (no implicit defaults).")
         sys.exit(1)
+    out_dir = resolve_under_project_root(ctx, out_dir)
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-
-def _insert_project_on_sys_path(project_root: Path) -> None:
-    """Ensure the project root is importable for type summarization."""
-    s = str(project_root)
+    # Ensure project root is importable (if downstream code needs imports)
+    pr = Path(ctx.project_root)
+    s = str(pr)
     if s not in sys.path:
         sys.path.insert(0, s)
 
+    # Formats: default to 'pickle' (only supported here)
+    formats = getattr(args, "formats", None) or ["pickle"]
 
-def _summarize_entries_by_func(
-    log, entries_by_func: Dict[str, List[dict]]
-) -> Dict[str, any]:
-    typed_infos: Dict[str, any] = {}
-    for func, entries in entries_by_func.items():
-        samples = [{"args": a, "kwargs": k, "result": r} for (a, k, r) in unique_cases(entries)]
-        if not samples:
-            continue
-        try:
-            info = summarize_function_types(func, samples)  # falls back if import fails
-            typed_infos[func] = info
-        except Exception as exc:
-            log.warning("Type inference failed for %s: %s", func, exc)
-    return typed_infos
+    # 1) Collect entries from traces
+    entries = collect_entries(storage_dir=storage_dir, formats=formats)
+    if not entries:
+        log.warning("No trace entries found in %s (formats=%s). Nothing to do.", storage_dir, formats)
+        return
 
+    # 2) Deduplicate/normalize cases
+    entries = unique_cases(entries)
 
-def _emit_stubs(grouped, out_dir: Path, log) -> int:
+    # 3) Summarize types per function
+    func_summaries = summarize_function_types(entries)
+
+    # 4) Group by module and render .pyi files
+    grouped = group_by_module(func_summaries)
     written = 0
     for module, funcs in grouped.items():
-        rel = Path(*module.split("."))
-        dest = out_dir / rel.with_suffix(".pyi")
+        rel = _module_to_rel_path(module)
+        dest = Path(out_dir) / rel.with_suffix(".pyi")
         dest.parent.mkdir(parents=True, exist_ok=True)
+
         src = render_stub_module(module, funcs)
         dest.write_text(src, encoding="utf-8")
         written += 1
         log.info("Wrote stub for module %s → %s", module, dest)
-    return written
 
-
-def _handle(args: argparse.Namespace) -> None:
-    log = configure_logger(name="pytead.cli.types")
-
-    # Optional user hint for config discovery
-    explicit_root = _as_path(getattr(args, "project_root", None))
-    ctx, eff_types = _load_effective_types_config(args, start=explicit_root)
-
-    # Decide final project root and anchor paths under it
-    project_root = _detect_project_root(ctx, explicit_root)
-
-    # Preferred flag
-    storage_dir = _as_path(getattr(args, "storage_dir", None))
-    # Back-compat (hidden): legacy --calls-dir
-    deprecated_calls = _as_path(getattr(args, "storage_dir_deprecated", None))
-    if storage_dir is None and deprecated_calls is not None:
-        storage_dir = deprecated_calls
-        log.warning("Option --calls-dir is deprecated; use --storage-dir instead.")
-
-    out_dir = _as_path(getattr(args, "out_dir", None))
-    formats = getattr(args, "formats", None)
-
-    storage_dir, out_dir = _finalize_io_paths(project_root, storage_dir, out_dir, eff_types)
-
-    _require(storage_dir is not None and out_dir is not None,
-             log, "You must provide both --storage-dir and --out-dir (or set them in [types]).")
-
-    _require(storage_dir.exists() and storage_dir.is_dir(),
-             log, f"Storage directory '{storage_dir}' does not exist or is not a directory")
-
-    # Ensure imports from the project resolve during summarization
-    _insert_project_on_sys_path(project_root)
-
-    # Collect traces and summarize type information
-    entries_by_func: Dict[str, List[dict]] = collect_entries(storage_dir=storage_dir, formats=formats)
-    if not entries_by_func:
-        log.error("No traces found in '%s' (formats=%s).", storage_dir, formats or "auto")
-        sys.exit(1)
-
-    typed_infos = _summarize_entries_by_func(log, entries_by_func)
-    if not typed_infos:
-        log.error("No usable samples for type inference.")
-        sys.exit(1)
-
-    grouped = group_by_module(typed_infos)
-    written = _emit_stubs(grouped, out_dir, log)
-    log.info("Generated %d stub module(s) into '%s'.", written, out_dir)
+    if written == 0:
+        log.warning("No stubs were generated (grouping was empty).")
+    else:
+        log.info("Generated %d stub module(s) into %s.", written, out_dir)
 
 
 def add_types_subparser(subparsers) -> None:
     p = subparsers.add_parser(
-        "types", help="infer types from traces and emit .pyi stub files"
+        "types",
+        help="read traces and generate .pyi stubs grouped by module",
     )
-    
+
+    # Input traces (validated via helper; may also come from [types].storage_dir)
     p.add_argument(
         "-s",
         "--storage-dir",
         type=Path,
         default=argparse.SUPPRESS,
-        help="directory containing trace files (if omitted, uses [types].storage_dir)",
+        help="directory containing trace files (defaults via layered config)",
     )
-    
+
+    # Output stubs (required via CLI or [types].out_dir)
     p.add_argument(
-        "-o",
-        "--out-dir",
+        "-d",
+        "--output-dir",
+        dest="output_dir",
         type=Path,
         default=argparse.SUPPRESS,
-        help="output directory root for .pyi files (if omitted, uses [types].out_dir)",
+        help="write stub files (.pyi) under this directory (defaults via layered config)",
     )
+
+    # Restrict input formats (only 'pickle' supported here)
     p.add_argument(
         "--formats",
         choices=["pickle"],
         nargs="*",
         default=argparse.SUPPRESS,
-        help="restrict formats when reading traces",
+        help="restrict formats when reading traces (default: pickle)",
     )
+
+    # Optional hint for config discovery and path anchoring
     p.add_argument(
         "--project-root",
         type=Path,
         default=argparse.SUPPRESS,
         help="project root to put on sys.path and to anchor relative paths (default: detected)",
     )
+
     p.set_defaults(handler=_handle)
 

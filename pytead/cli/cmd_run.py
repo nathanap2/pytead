@@ -14,20 +14,14 @@ from ._cli_utils import (
     first_py_token,
     require_script_py_or_exit,
 )
-from .config_cli import load_layered_config, apply_effective_to_args, effective_section
+from .config_cli import (
+    load_layered_config, apply_effective_to_args, effective_section,
+    resolve_under_project_root,
+)
 from . import service_cli as svc  # couche services dans le même paquet CLI
 
 
 
-def _require_fields(args: argparse.Namespace, names: list[str], logger) -> None:
-    missing = [n for n in names if not hasattr(args, n)]
-    if missing:
-        logger.error(
-            "Missing required options for 'run': %s. Provide them via CLI or config "
-            "([defaults]/[run]).",
-            ", ".join(missing),
-        )
-        sys.exit(1)
 
 
 def _handle(args: argparse.Namespace) -> None:
@@ -40,9 +34,6 @@ def _handle(args: argparse.Namespace) -> None:
     start_hint = first_py_token(getattr(args, "cmd", None))
     ctx = load_layered_config(start=start_hint)
     apply_effective_to_args("run", ctx, args)
-
-    # Required fields can come from config
-    _require_fields(args, ["limit", "storage_dir", "format"], log)
 
     # Split positionals into targets and the script command
     targets, cmd = split_targets_and_cmd(
@@ -64,18 +55,11 @@ def _handle(args: argparse.Namespace) -> None:
     if not cmd:
         log.error("No script specified after '--'")
         sys.exit(1)
-
-    # Validate script path
-    script = cmd[0]
-    if not isinstance(script, str) or not script.endswith(".py"):
-        log.error("Unsupported script '%s': only .py files are allowed", script)
-        sys.exit(1)
     script_path = require_script_py_or_exit(cmd, log)
-
     # Additional import roots:
     # Keep them as given (possibly relative). compute_import_roots will anchor them on project root.
     raw_extra = getattr(args, "additional_sys_path", None) or []
-    add_paths: List[Path] = [Path(p) for p in raw_extra]
+    add_paths: List[Path] = [resolve_under_project_root(ctx, p) for p in raw_extra]
 
     # Delegate to service layer: prepare imports, instrument, run
     try:

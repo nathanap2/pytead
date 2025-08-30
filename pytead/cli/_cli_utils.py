@@ -13,6 +13,8 @@ __all__ = [
     "fallback_targets_from_cfg",
     "emptyish",
     "first_py_token",
+    "detect_start_hint",
+    "require_fields_or_exit",
     "require_script_py_or_exit",
     "resolve_output_paths",
     "ensure_storage_dir_or_exit",
@@ -230,4 +232,11 @@ def resolve_under(root: Path, p: Optional[Path]) -> Optional[Path]:
     if p is None:
         return None
     return p if p.is_absolute() else (root / p)
+
+def detect_start_hint(args) -> Optional[Path]:
+    """
+    Return a good starting point for layered-config discovery by scanning
+    the parsed args for the first '*.py' token in either `cmd` or `targets`.
+    """
+    return first_py_token(getattr(args, "cmd", None)) or first_py_token(getattr(args, "targets", None))
 

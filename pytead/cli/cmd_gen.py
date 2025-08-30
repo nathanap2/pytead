@@ -73,8 +73,7 @@ def add_gen_subparser(subparsers) -> None:
     p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS,
                    help="directory containing trace files (defaults via layered config)")
 
-    p.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS,
-                   help="write one test module per function into this directory (default: tests/generated)")
+    p.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS)
 
 
     p.add_argument("--formats", choices=["pickle", "graph-json"], nargs="*", default=argparse.SUPPRESS)

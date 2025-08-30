@@ -386,7 +386,7 @@ def apply_effective_to_args(section: str, ctx: ConfigContext, args) -> None:
             _log.info("  -> filled '%s' from config: %r", k, v)
     _log.info("Args AFTER  fill: %s", {k: box[k] for k in sorted(box)})
 
-def _resolve_under_project_root(ctx: ConfigContext, p: Path | str | None) -> Path | None:
+def resolve_under_project_root(ctx: ConfigContext, p: Path | str | None) -> Path | None:
     """Return an absolute path anchored under ctx.project_root for relative inputs."""
     if p is None:
         return None
@@ -461,10 +461,10 @@ def diagnostics_for_storage_dir(ctx: ConfigContext, section: str, cli_value: Pat
     c_def  = eff_def.get("storage_dir")
     c_typ  = eff_typ.get("storage_dir")
 
-    r_cli  = _resolve_under_project_root(ctx, c_cli)
-    r_sec  = _resolve_under_project_root(ctx, c_sec)
-    r_def  = _resolve_under_project_root(ctx, c_def)
-    r_typ  = _resolve_under_project_root(ctx, c_typ)
+    r_cli  = resolve_under_project_root(ctx, c_cli)
+    r_sec  = resolve_under_project_root(ctx, c_sec)
+    r_def  = resolve_under_project_root(ctx, c_def)
+    r_typ  = resolve_under_project_root(ctx, c_typ)
 
     lines: List[str] = []
     lines.append("=== pytead GEN diagnostics (storage_dir) ===")

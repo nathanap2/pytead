@@ -4,186 +4,151 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-from .config_cli import load_layered_config, apply_effective_to_args, effective_section
+from ..logconf import configure_logger
+from .config_cli import (
+    load_layered_config,
+    apply_effective_to_args,
+    effective_section,
+)
 from ._cli_utils import (
     split_targets_and_cmd,
     fallback_targets_from_cfg,
-)
-from ._cli_utils import (
-    first_py_token as _first_py_token,
+    first_py_token,
     resolve_under,
     require_script_py_or_exit,
 )
-
-from ..logconf import configure_logger
 from . import service_cli as svc
 
 
-def _project_root_from_config_source(src: Optional[Path]) -> Optional[Path]:
-    """
-    Si la config projet provient de '<root>/.pytead/config.*', remonte d'un cran
-    pour obtenir la racine projet; sinon retourne le dossier de la config.
-    """
-    if not src:
+log = configure_logger(name="pytead.cli.tead")
+
+
+def _as_path(x: Optional[Path | str]) -> Optional[Path]:
+    if x is None:
         return None
-    cfg_dir = src.parent
-    return cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
+    return x if isinstance(x, Path) else Path(x)
 
 
 def run(args: argparse.Namespace) -> None:
     """
-    Implémentation de `pytead tead` :
-      - charge la config en couches et applique les valeurs effectives,
-      - résout cibles + script,
-      - délègue instrumentation + exécution à la couche services,
-      - génère les tests depuis les traces collectées.
+    Combined command: instrument+run, then generate tests immediately.
 
-    La logique est volontairement mince; toute la “vraie” mécanique vit dans
-    pytead/cli/service_cli.py.
+    Behavior:
+      - Supports the common mistake where the script .py is passed among `targets`
+        (handled by split_targets_and_cmd).
+      - Loads layered config from the first '*.py' token in cmd/targets.
+      - Anchors storage_dir, out_dir and additional_sys_path under project_root.
+      - Fallback chain for `targets` and `out_dir` using [tead]/[run]/[gen].
     """
-    log = configure_logger(name="pytead.tead")
-
-    # --- 0) Positionnels
+    # --- 0) Split positionals
     raw_targets = getattr(args, "targets", []) or []
     raw_cmd = getattr(args, "cmd", []) or []
     targets, cmd = split_targets_and_cmd(raw_targets, raw_cmd)
 
-    # Indice de départ pour la découverte de config
-    script_from_cmd = _first_py_token(cmd)
-    script_from_targets = _first_py_token(targets)
-    start_hint: Optional[Path] = (
-        script_from_cmd.parent
-        if script_from_cmd
-        else (script_from_targets.parent if script_from_targets else None)
-    )
+    # Hint for config discovery
+    start_hint = first_py_token(cmd)
 
-    # --- 1) Config en couches & remplissage
+    # --- 1) Layered config → args
     ctx = load_layered_config(start=start_hint)
     apply_effective_to_args("tead", ctx, args)
 
-    # --- 2) Exigences minimales
-    missing = [k for k in ("limit", "storage_dir", "format") if not hasattr(args, k)]
-    if missing:
-        log.error(
-            "Missing required options for 'tead': %s. Provide them via CLI or config "
-            "([defaults]/[tead]). Config used: %s",
-            ", ".join(missing),
-            str(ctx.source_path) if ctx.source_path else "<none>",
-        )
-        sys.exit(1)
+    eff_tead = effective_section(ctx, "tead") or {}
+    eff_run = effective_section(ctx, "run") or {}
+    eff_gen = effective_section(ctx, "gen") or {}
 
-    # --- 3) Cibles (CLI → fallback config [tead] puis [run])
-    eff_tead = effective_section(ctx, "tead")
-    eff_run = effective_section(ctx, "run")
-
+    # Targets: CLI → [tead].targets → [run].targets
     targets = fallback_targets_from_cfg(targets, eff_tead, log, "TEAD")
     if not targets:
-        run_targets = (eff_run or {}).get("targets")
-        if run_targets:
-            targets = list(run_targets)
+        targets = fallback_targets_from_cfg(targets, eff_run, log, "RUN")
     if not targets:
-        log.error("No target provided. Config used: %s", ctx.source_path or "<none>")
-        sys.exit(1)
-    if not cmd:
-        log.error("No script specified after '--'")
+        log.error(
+            "No target provided. Expect at least one 'module.function' or 'module.Class.method'. "
+            "Config file used: %s",
+            str(getattr(ctx, "source_path", None) or "<none>"),
+        )
         sys.exit(1)
 
-    # --- 4) Racine & répertoire de traces (ancrés)
-    project_root = (
-        _project_root_from_config_source(ctx.source_path)
-        or (script_from_cmd.parent if script_from_cmd else None)
-        or Path.cwd()
+    # Require a Python script after '--'
+    script_path = require_script_py_or_exit(cmd, log)
+
+    # --- 2) Path anchoring under project_root
+    project_root = Path(ctx.project_root)
+
+    storage_dir = _as_path(getattr(args, "storage_dir"))
+    storage_dir = resolve_under(project_root, storage_dir)
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    out_dir = (
+        getattr(args, "output_dir", None)
+        or eff_tead.get("out_dir")
+        or eff_gen.get("out_dir")
     )
-    raw_storage = Path(getattr(args, "storage_dir"))
-    storage_dir_abs = (
-        raw_storage if raw_storage.is_absolute() else (project_root / raw_storage)
-    ).resolve()
-    storage_dir_abs.mkdir(parents=True, exist_ok=True)
+    out_dir = resolve_under(project_root, _as_path(out_dir))
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Project root: %s", project_root)
-    log.info("Storage dir : %s", storage_dir_abs)
-
-    # --- 5) Chemins d'import supplémentaires (relatifs ancrés sur project_root)
+    # additional_sys_path : CLI → [tead] → [run]
     extra_paths = (
         getattr(args, "additional_sys_path", None)
-        or (eff_tead or {}).get("additional_sys_path")
-        or (eff_run or {}).get("additional_sys_path")
+        or eff_tead.get("additional_sys_path")
+        or eff_run.get("additional_sys_path")
         or []
     )
-    add_paths: List[Path] = []
-    for p in extra_paths:
-        pp = Path(p)
-        add_paths.append(pp if pp.is_absolute() else (project_root / pp))
+    add_paths: List[Path] = [resolve_under(project_root, _as_path(p)) for p in extra_paths]
 
-    # --- 6) Instrumentation + exécution via service layer
-    script_path = require_script_py_or_exit(cmd, log)
-    try:
-        instr, outcome, roots = svc.instrument_and_run(
-            targets=targets,
-            limit=getattr(args, "limit"),
-            storage_dir=storage_dir_abs,
-            storage=getattr(args, "format"),
-            script_file=script_path,
-            argv=cmd,
-            additional_sys_path=add_paths,
-            logger=log,
-        )
-    except Exception as exc:
-        log.error("TEAD failed during instrument+run: %s", exc)
-        sys.exit(1)
-
-    log.info(
-        "Instrumentation applied to %d target(s): %s",
-        len(instr.seen),
-        ", ".join(sorted(instr.seen)),
+    # --- 3) Instrument + run
+    instr, outcome, roots = svc.instrument_and_run(
+        targets=targets,
+        limit=getattr(args, "limit"),
+        storage_dir=storage_dir,
+        storage=getattr(args, "format"),
+        script_file=script_path,
+        argv=cmd,
+        additional_sys_path=add_paths,
+        logger=log,
     )
-    if outcome.status.name == "OK":
-        log.info("Script run completed successfully.")
-    elif outcome.status.name == "SYSTEM_EXIT":
-        log.info("Script exited with code %s.", outcome.exit_code)
-    elif outcome.status.name == "KEYBOARD_INTERRUPT":
-        log.warning("Script interrupted (KeyboardInterrupt).")
-    else:
-        log.error("Script terminated abnormally: %s", outcome.detail or "unknown error")
 
-    # --- 7) Génération — chemins ancrés sur project_root
-    out_dir = args.output_dir
-    out_dir = resolve_under(project_root, out_dir)
-        
+    # --- 4) Generate tests immediately
+    gen_formats = getattr(args, "gen_formats", None) or [getattr(args, "format")]
+    only_targets = targets if getattr(args, "only_targets", False) else None
 
-    gen_formats = getattr(args, "gen_formats", None)
-    only_targets = sorted(instr.seen) if getattr(args, "only_targets", False) else None
-    res = svc.collect_and_emit_tests(
-        storage_dir=storage_dir_abs,
+    svc.collect_and_emit_tests(
+        storage_dir=storage_dir,
         formats=gen_formats,
         output_dir=out_dir,
-        import_roots=roots,  # racines réellement utilisées pendant l'exécution
+        import_roots=roots,
         only_targets=only_targets,
         logger=log,
     )
-    if res:
-        log.info(
-            "Generated %d unique case(s) across %d file(s).",
-            res.unique_cases,
-            res.files_written,
-        )
-    else:
-        log.warning("No tests generated (no traces or filter excluded everything).")
 
 
 def add_tead_subparser(subparsers) -> None:
     p = subparsers.add_parser("tead", help="trace and immediately generate tests (all-in-one)")
-    p.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS)
-    p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS)
-    p.add_argument("--format", choices=["pickle", "graph-json"], default=argparse.SUPPRESS)
-    p.add_argument("--gen-formats", choices=["pickle", "graph-json"], nargs="*", default=argparse.SUPPRESS)
 
-    p.add_argument("--only-targets", action="store_true", default=argparse.SUPPRESS)
+    # Capture options (mirror 'run')
+    p.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS,
+                   help="max calls to record per function")
+    p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS,
+                   help="directory to write trace files (defaults via layered config)")
+    p.add_argument("--format", choices=["pickle", "graph-json"], default=argparse.SUPPRESS,
+                   help="trace format to write (default via layered config)")
+
+    # Generation options (mirror 'gen')
+    p.add_argument("--gen-formats", choices=["pickle", "graph-json"], nargs="*", default=argparse.SUPPRESS)
+    p.add_argument("--only-targets", action="store_true", default=argparse.SUPPRESS,
+                   help="only emit tests for the provided targets (skip other traced functions)")
     p.add_argument("-d", "--output-dir", dest="output_dir", type=Path, default=argparse.SUPPRESS)
+
+    # Import roots (shared policy with run/gen)
     p.add_argument("--additional-sys-path", dest="additional_sys_path", nargs="*", default=argparse.SUPPRESS)
-    p.add_argument("targets", nargs="*", default=argparse.SUPPRESS)
-    p.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    # Positionals: targets then the script after '--'
+    p.add_argument("targets", nargs="*", default=argparse.SUPPRESS,
+                   metavar="target",
+                   help="one or more targets: 'module.function' or 'module.Class.method'")
+    p.add_argument("cmd", nargs=argparse.REMAINDER,
+                   help="-- then the Python script to run (with its arguments)")
+
     p.set_defaults(handler=run)
 

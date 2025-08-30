@@ -8,6 +8,7 @@ limit = 2
 
 [gen]
 output_dir = "tests/generated"
+out_dir = "tests_out"
 
 [types]
 storage_dir = "call_logs"
