@@ -2,126 +2,78 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import List
 
-from ..errors import PyteadError
-from ..logconf import configure_logger
-from ._cli_utils import (
-    split_targets_and_cmd,
-    fallback_targets_from_cfg,
-    first_py_token,
-    require_script_py_or_exit,
+from . import service_cli as svc
+from ._cli_utils import extract_script_and_argv
+from ._common import (
+    make_logger,
+    load_ctx_anchored,
+    eff,
+    norm_roots,
+    storage_for_write,
+    compute_targets,
+    add_opt_storage_dir,
+    add_opt_format,
+    add_opt_additional_sys_path,
+    add_opt_targets,
+    add_opt_cmd_remainder,
 )
-from .config_cli import (
-    load_layered_config, apply_effective_to_args, effective_section,
-    resolve_under_project_root,
-)
-from . import service_cli as svc  # couche services dans le même paquet CLI
-
-
-
 
 
 def _handle(args: argparse.Namespace) -> None:
-    """
-    Thin handler: merges layered config into args, validates, then delegates to service layer.
-    """
-    log = configure_logger(name="pytead.cli.run")
+    log = make_logger("run")
 
-    # Prefer discovering config from the script directory if provided
-    start_hint = first_py_token(getattr(args, "cmd", None))
-    ctx = load_layered_config(start=start_hint)
-    apply_effective_to_args("run", ctx, args)
+    # 1) Script + argv (supports the `--` sentinel)
+    script_path, argv = extract_script_and_argv(list(getattr(args, "cmd", []) or []), log)
 
-    # Split positionals into targets and the script command
-    targets, cmd = split_targets_and_cmd(
-        getattr(args, "targets", []) or [],
-        getattr(args, "cmd", []) or [],
-    )
+    # 2) Load layered config anchored on the script location; hydrate [run] into args
+    ctx = load_ctx_anchored("run", args, script_path)
 
-    # Fallback to config-provided targets if none on the CLI
-    eff_run = effective_section(ctx, "run")
-    targets = fallback_targets_from_cfg(targets, eff_run, log, "RUN")
-
+    # 3) Targets: CLI → [run].targets (no implicit defaults beyond that)
+    eff_run = eff(ctx, "run")
+    targets: List[str] = compute_targets(getattr(args, "targets", None), [eff_run], log, "RUN")
     if not targets:
-        log.error(
-            "No target provided. Expect at least one 'module.function' or 'module.Class.method'. "
-            "Config file used: %s",
-            str(ctx.source_path) if ctx.source_path else "<none>",
-        )
-        sys.exit(1)
-    if not cmd:
-        log.error("No script specified after '--'")
-        sys.exit(1)
-    script_path = require_script_py_or_exit(cmd, log)
-    # Additional import roots:
-    # Keep them as given (possibly relative). compute_import_roots will anchor them on project root.
-    raw_extra = getattr(args, "additional_sys_path", None) or []
-    add_paths: List[Path] = [resolve_under_project_root(ctx, p) for p in raw_extra]
+        log.warning("No target provided; nothing to instrument.")
+        return
 
-    # Delegate to service layer: prepare imports, instrument, run
-    try:
-        instr, outcome, roots = svc.instrument_and_run(
-            targets=targets,
-            limit=getattr(args, "limit"),
-            storage_dir=Path(getattr(args, "storage_dir")),
-            storage=getattr(args, "format"),
-            script_file=script_path,
-            argv=cmd,
-            additional_sys_path=add_paths,
-            logger=log,
-        )
-    except PyteadError:
-        raise
-    except Exception as exc:
-        log.error("Run failed: %s", exc)
-        sys.exit(1)
+    # 4) Resolve storage_dir for write mode (mkdir if needed)
+    storage_dir: Path = storage_for_write(ctx, getattr(args, "storage_dir", None), log)
 
-    # Summaries
-    log.info(
-        "Instrumentation applied to %d target(s): %s",
-        len(instr.seen),
-        ", ".join(sorted(instr.seen)),
+    # 5) Additional import roots (absolute); service expects Paths here
+    project_root = Path(ctx.project_root)
+    _abs_roots, add_paths = norm_roots(project_root, getattr(args, "additional_sys_path", None))
+
+    # 6) Orchestrate: instrument → run (no exit-code mapping, let exceptions bubble)
+    svc.instrument_and_run(
+        targets=targets,
+        limit=getattr(args, "limit", None),
+        storage_dir=storage_dir,
+        storage=getattr(args, "format", None),
+        script_file=script_path,
+        argv=argv,
+        additional_sys_path=add_paths,
+        project_root=project_root,
+        logger=log,
     )
-    if outcome.status.name == "OK":
-        log.info("Script run completed successfully.")
-    elif outcome.status.name == "SYSTEM_EXIT":
-        log.info("Script exited with code %s.", outcome.exit_code)
-    elif outcome.status.name == "KEYBOARD_INTERRUPT":
-        log.warning("Script interrupted (KeyboardInterrupt).")
-    else:
-        log.error("Script terminated abnormally: %s", outcome.detail or "unknown error")
 
 
-def add_run_subparser(subparsers) -> None:
-    p = subparsers.add_parser(
-        "run",
-        help=(
-            "instrument one or more functions/methods and execute a Python script "
-            "(use -- to separate targets from the script)"
-        ),
-    )
-    # No hard-coded defaults: layered config fills missing values
-    p.add_argument("-l", "--limit", type=int, default=argparse.SUPPRESS)
-    p.add_argument("-s", "--storage-dir", type=Path, default=argparse.SUPPRESS)
-    p.add_argument("--format", choices=["pickle", "graph-json"], default=argparse.SUPPRESS)
-    p.add_argument(
-        "--additional-sys-path",
-        dest="additional_sys_path",
-        nargs="*",
-        default=argparse.SUPPRESS,
-        help="extra import roots (relative paths are anchored on the project root)",
-    )
+def add_run_subparser(subparsers: argparse._SubParsersAction) -> None:
+    p = subparsers.add_parser("run", help="instrument targets then run a Python script")
 
     p.add_argument(
-        "targets",
-        nargs="*",
+        "--limit",
+        type=int,
         default=argparse.SUPPRESS,
-        metavar="target",
-        help="one or more targets: 'module.function' or 'module.Class.method'",
+        help="max number of calls to capture per target (default from config)",
     )
-    p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- then the Python script to run (with arguments)")
+
+    add_opt_storage_dir(p, for_read=False)
+    add_opt_format(p)
+    add_opt_additional_sys_path(p)
+    add_opt_targets(p)
+    add_opt_cmd_remainder(p)
+
     p.set_defaults(handler=_handle)
 

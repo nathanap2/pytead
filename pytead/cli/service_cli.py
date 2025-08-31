@@ -68,25 +68,48 @@ class GenerationResult:
 # ---------- Low-level services (no argparse, no config IO) ----------
 
 def prepare_import_env(
-     script_path: Optional[Path],
-     additional_paths: Iterable[Path] = (),
-     *,
-     project_root: Optional[Path] = None,
-     logger: Optional[logging.Logger] = None,
- ) -> List[str]:
+    script_path: Optional[Path],
+    additional_paths: Iterable[Path] = (),
+    *,
+    project_root: Optional[Path] = None,
+    logger: Optional[logging.Logger] = None,
+) -> List[str]:
     """
-    Compute and prepend import roots into sys.path:
-      1) script directory (if provided),
-      2) project root (derived from config.LAST_CONFIG_PATH),
-      3) any additional paths.
-    Returns the effective absolute roots inserted.
+    Compute and prepend import roots into sys.path.
+
+    Policy (v1):
+      - If a project_root is provided, it MUST be placed FIRST.
+      - Other roots (script directory, additional paths) follow, preserving their
+        original order and removing duplicates.
+      - The working directory of the process is irrelevant here; only explicit
+        roots matter.
+
+    Returns:
+        The effective absolute roots (as strings) that were inserted (in order).
     """
+    # Delegate to the shared resolver (keeps stable deterministic ordering).
     roots = compute_import_roots(script_path, additional_paths, project_root=project_root)
+
+    # Enforce "project_root first" if provided, while preserving order and deduplicating.
+    if project_root is not None:
+        pr = str(Path(project_root).resolve())
+        # Bring pr to the front, then keep others in order (no duplicates).
+        ordered = [pr] + [r for r in roots if r != pr]
+        # Final de-dup in case compute_import_roots already included pr at pos 0.
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for r in ordered:
+            if r not in seen:
+                deduped.append(r)
+                seen.add(r)
+        roots = deduped
+
+    # Actually prepend into sys.path (front-load, left-to-right).
     prepend_sys_path(roots)
+
     if logger:
         logger.info("Import roots: %s", roots)
     return roots
-
 
 def instrument_targets(
     targets: Sequence[str],
@@ -117,28 +140,54 @@ def run_script(
     logger: Optional[logging.Logger] = None,
 ) -> RunOutcome:
     """
-    Execute a .py file with runpy, setting sys.argv to `argv`. Does not exit the caller.
+    Execute a .py file with runpy, setting sys.argv to `argv`, and
+    temporarily changing the process CWD to the script's parent directory.
+
+    Rationale:
+      - Many scripts assume relative file access from their own directory.
+      - The project_root is an import concern, not the execution CWD.
     """
     if script_file.suffix != ".py":
         return RunOutcome(RunStatus.EXCEPTION, detail=f"Unsupported script: {script_file}")
 
     sys.argv = argv
+    old_cwd: Optional[Path] = None
+
     try:
+        # Change CWD to the script directory for the duration of the run.
+        import os
+        old_cwd = Path.cwd()
+        os.chdir(script_file.parent)
+
         runpy.run_path(str(script_file), run_name="__main__")
         return RunOutcome(RunStatus.OK)
+
     except SystemExit as exc:
         code = getattr(exc, "code", 0)
         if logger:
             logger.info("Script exited with SystemExit(%s).", code)
         return RunOutcome(RunStatus.SYSTEM_EXIT, exit_code=code)
+
     except KeyboardInterrupt:
         if logger:
             logger.warning("Script interrupted (KeyboardInterrupt).")
         return RunOutcome(RunStatus.KEYBOARD_INTERRUPT)
+
     except BaseException as exc:
         if logger:
             logger.error("Script terminated: %r", exc)
         return RunOutcome(RunStatus.EXCEPTION, detail=repr(exc))
+
+    finally:
+        # Always restore the original CWD (best-effort).
+        if old_cwd is not None:
+            try:
+                import os
+                os.chdir(old_cwd)
+            except Exception:
+                # We do not fail the entire command if restoring CWD fails.
+                if logger:
+                    logger.debug("Could not restore previous CWD to %s", old_cwd)
 
 
 def collect_traces(
@@ -202,6 +251,7 @@ def emit_tests(
 
 # ---------- Composed services used by commands ----------
 
+
 def instrument_and_run(
     *,
     targets: Sequence[str],
@@ -211,17 +261,39 @@ def instrument_and_run(
     script_file: Path,
     argv: List[str],
     additional_sys_path: Iterable[Path] = (),
+    project_root: Optional[Path] = None,
     logger: Optional[logging.Logger] = None,
 ) -> Tuple[InstrumentResult, RunOutcome, List[str]]:
     """
-    1) Prepare sys.path, 2) instrument targets, 3) run the script.
-    Returns (instrumentation result, run outcome, effective import roots).
-    """
-    roots = prepare_import_env(script_file, additional_sys_path, logger=logger)
-    instr = instrument_targets(targets, limit, storage_dir, storage, logger=logger)
-    outcome = run_script(script_file, argv, logger=logger)
-    return instr, outcome, roots
+    Orchestrate the end-to-end flow:
+      1) Prepare import environment (sys.path),
+      2) Instrument the requested targets,
+      3) Run the script.
 
+    Returns:
+        (instrumentation result, run outcome, effective import roots)
+    """
+    # 1) Prepare sys.path with the enforced ordering: project_root FIRST if provided.
+    roots = prepare_import_env(
+        script_path=script_file,
+        additional_paths=additional_sys_path,
+        project_root=project_root,                 # <-- pass-through
+        logger=logger,
+    )
+
+    # 2) Instrument targets into the chosen storage.
+    instr = instrument_targets(
+        targets=targets,
+        limit=limit,
+        storage_dir=storage_dir,
+        storage=storage,
+        logger=logger,
+    )
+
+    # 3) Execute the script (with proper argv and a temporary CWD = script dir).
+    outcome = run_script(script_file, argv, logger=logger)
+
+    return instr, outcome, roots
 
 def collect_and_emit_tests(
     *,

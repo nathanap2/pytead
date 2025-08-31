@@ -305,7 +305,7 @@ def test_cmd_run_discovers_config_from_script_dir(tmp_path, monkeypatch, caplog)
 
         # We should have instrumented the config-provided target
         log_text = "\n".join(rec.message for rec in caplog.records)
-        assert "Instrumentation applied" in log_text
+        assert "Instrumented" in log_text
         assert "mymodule.multiply" in log_text
 
         # And repo should have been added to sys.path by import env setup

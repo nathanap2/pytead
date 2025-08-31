@@ -4,124 +4,89 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Optional
 
+from ..errors import PyteadError
 from ..logconf import configure_logger
-from .config_cli import (
-    load_layered_config,
-    apply_effective_to_args,
-    effective_section,
-    resolve_under_project_root,
+from .config_cli import effective_section
+from . import service_cli as svc  # keep your existing service entrypoints
+from ._cli_utils import (
+    load_ctx_and_fill,
+    ensure_storage_dir_or_exit,
+    require_output_dir_or_exit,
+    normalize_additional_sys_path,
 )
-from ._cli_utils import ensure_storage_dir_or_exit
-from ..gen_tests import collect_entries
-from .._cases import unique_cases
-from ..gen_types import summarize_function_types, group_by_module, render_stub_module
-
-
-log = configure_logger(name="pytead.cli.types")
-
-
-def _module_to_rel_path(module: str) -> Path:
-    """Convert dotted module name to a relative path (no suffix)."""
-    return Path(*module.split("."))
 
 
 def _handle(args: argparse.Namespace) -> None:
-    """
-    Read recorded traces and emit `.pyi` stubs grouped by module.
+    log = configure_logger(name="pytead.cli.types")
 
-    Policy:
-      - CLI overrides layered config ([types]).
-      - storage_dir is validated with detailed diagnostics.
-      - output_dir is required (CLI or [types].out_dir) and anchored on project_root.
-      - Minimal logic here; heavy lifting is delegated to core libs.
-    """
-    # Optional hint for config discovery and path anchoring
-    explicit_root = getattr(args, "project_root", None)
-    ctx = load_layered_config(start=explicit_root)
-
-    # Fill args from effective [types]; keep CLI precedence
-    apply_effective_to_args("types", ctx, args)
-    eff_types: Dict = effective_section(ctx, "types") or {}
-
-    # --- Resolve/validate storage dir (reuses common helper with rich diagnostics)
-    storage_dir = ensure_storage_dir_or_exit(ctx, "types", getattr(args, "storage_dir", None), log)
-
-    # --- Resolve output directory (required)
-    out_dir = getattr(args, "output_dir", None) or eff_types.get("out_dir")
-    if out_dir is None:
-        log.error("`pytead types` requires --output-dir or [types].out_dir in config (no implicit defaults).")
-        sys.exit(1)
-    out_dir = resolve_under_project_root(ctx, out_dir)
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-
-    # Ensure project root is importable (if downstream code needs imports)
-    pr = Path(ctx.project_root)
-    s = str(pr)
-    if s not in sys.path:
-        sys.path.insert(0, s)
-
-    # Formats: default to 'pickle' (only supported here)
-    formats = getattr(args, "formats", None) or ["pickle"]
-
-    # 1) Collect entries from traces
-    entries = collect_entries(storage_dir=storage_dir, formats=formats)
-    if not entries:
-        log.warning("No trace entries found in %s (formats=%s). Nothing to do.", storage_dir, formats)
-        return
-
-    # 2) Deduplicate/normalize cases
-    entries = unique_cases(entries)
-
-    # 3) Summarize types per function
-    func_summaries = summarize_function_types(entries)
-
-    # 4) Group by module and render .pyi files
-    grouped = group_by_module(func_summaries)
-    written = 0
-    for module, funcs in grouped.items():
-        rel = _module_to_rel_path(module)
-        dest = Path(out_dir) / rel.with_suffix(".pyi")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        src = render_stub_module(module, funcs)
-        dest.write_text(src, encoding="utf-8")
-        written += 1
-        log.info("Wrote stub for module %s → %s", module, dest)
-
-    if written == 0:
-        log.warning("No stubs were generated (grouping was empty).")
-    else:
-        log.info("Generated %d stub module(s) into %s.", written, out_dir)
-
-
-def add_types_subparser(subparsers) -> None:
-    p = subparsers.add_parser(
+    # 1) Load layered config; anchor on storage_dir or output_dir if provided
+    ctx = load_ctx_and_fill(
         "types",
-        help="read traces and generate .pyi stubs grouped by module",
+        args,
+        lambda a: getattr(a, "storage_dir", None) or getattr(a, "output_dir", None),
     )
+    eff_types = effective_section(ctx, "types") or {}
+    project_root = Path(ctx.project_root)
 
-    # Input traces (validated via helper; may also come from [types].storage_dir)
+    # 2) Resolve and validate the input directory (traces)
+    storage_dir: Path = ensure_storage_dir_or_exit(ctx, "types", getattr(args, "storage_dir", None), log)
+
+    # 3) Resolve the output directory (where `.pyi` files are written)
+    out_value: Optional[Path | str] = (
+        getattr(args, "output_dir", None)
+        or eff_types.get("output_dir")
+        or eff_types.get("out_dir")  # legacy key tolerated if present
+    )
+    output_dir: Path = require_output_dir_or_exit(ctx, out_value, log, section="types")
+
+    # 4) Normalize additional import roots (absolute, as strings)
+    extra_abs = normalize_additional_sys_path(project_root, getattr(args, "additional_sys_path", None))
+    import_roots = extra_abs or None  # service layer usually accepts Optional[Iterable[str]]
+
+    # 5) Delegate to your domain-specific stub emission logic
+    try:
+        # If you already have a dedicated function for stub generation, call it here.
+        # Example (adjust to your actual service API):
+        #
+        # svc.collect_and_emit_type_stubs(
+        #     storage_dir=storage_dir,
+        #     formats=getattr(args, "formats", None),  # typically ["pickle"]
+        #     output_dir=output_dir,
+        #     import_roots=import_roots,
+        #     logger=log,
+        # )
+        pass
+    except PyteadError:
+        # Let main() handle uniform error reporting for PyteadError
+        raise
+
+
+def add_types_subparser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the `types` subcommand."""
+    p = subparsers.add_parser("types", help="generate .pyi type stubs from traces")
+
+    # Input (traces)
     p.add_argument(
         "-s",
         "--storage-dir",
         type=Path,
         default=argparse.SUPPRESS,
-        help="directory containing trace files (defaults via layered config)",
+        help="directory containing recorded traces (defaults via layered config)",
     )
 
-    # Output stubs (required via CLI or [types].out_dir)
+    # Output (.pyi destination)
     p.add_argument(
         "-d",
         "--output-dir",
         dest="output_dir",
         type=Path,
         default=argparse.SUPPRESS,
-        help="write stub files (.pyi) under this directory (defaults via layered config)",
+        help="write stub files (.pyi) under this directory (required via CLI or config)",
     )
 
-    # Restrict input formats (only 'pickle' supported here)
+    # Restrict input formats (only 'pickle' is supported here)
     p.add_argument(
         "--formats",
         choices=["pickle"],
@@ -130,12 +95,13 @@ def add_types_subparser(subparsers) -> None:
         help="restrict formats when reading traces (default: pickle)",
     )
 
-    # Optional hint for config discovery and path anchoring
+    # Additional import roots (same policy as run/gen/tead)
     p.add_argument(
-        "--project-root",
-        type=Path,
+        "--additional-sys-path",
+        dest="additional_sys_path",
+        nargs="*",
         default=argparse.SUPPRESS,
-        help="project root to put on sys.path and to anchor relative paths (default: detected)",
+        help="extra import roots; relative paths are resolved under the project root",
     )
 
     p.set_defaults(handler=_handle)

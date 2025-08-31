@@ -233,7 +233,11 @@ only_targets = true
 
 ### Import bootstrapping & `sys.path.append`
 
-Generated tests insert **import roots** (script dir, detected project root, plus user-provided extra paths). This keeps tests importable even if the source used `sys.path.append(...)`.
+Generated tests insert import roots with this order:
+1) **project root**
+2) **script directory**,
+3) **additional_sys_path**
+
 
 ### Graph snapshot semantics
 

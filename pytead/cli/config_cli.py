@@ -313,18 +313,43 @@ def _is_emptyish(v: Any) -> bool:
 
 # ---------- Public API (CLI-only) ----------
 
+
 def load_layered_config(start: Optional[Path] = None) -> ConfigContext:
     """
-    Layered load:
-      base = packaged defaults (pytead/default_config.toml) — si présent
-      base <- user-level config (if any)
-      base <- nearest project config from `start` (if any)
+    Layered load (deterministic, script-anchored when possible):
+
+        base = packaged defaults (pytead/default_config.toml), if present
+        base <- user-level config (if any)
+        base <- nearest project config from `start` (if any)
+
+    project_root resolution:
+        - If a project config is found: project_root = its directory,
+          except when the config lives under '.pytead/', in which case
+          project_root = parent of that '.pytead' directory.
+        - If no project config is found:
+              project_root = fallback(start) with the chain:
+                  VCS root → Python project root → anchor directory.
+          IMPORTANT: we *ignore* the process CWD whenever `start` is provided.
+          If `start` is None (e.g., some non-script CLI), we explicitly use CWD
+          as the anchor (this is a conscious UX choice for those commands).
+
+    Parameters
+    ----------
+    start : Optional[Path]
+        Anchor for discovery (preferably the script path). When provided, we do
+        not consult the process CWD for project_root resolution.
+
+    Returns
+    -------
+    ConfigContext
+        Contains the merged raw config, detected project_root, the config file
+        path used (if any), and the debug event buffer.
     """
-    # Reset du buffer d’événements
+    # Reset debug-event buffer
     global _DEBUG_EVENTS
     _DEBUG_EVENTS = []
 
-    # 1) Packagé
+    # 1) Packaged defaults
     base: Dict[str, Any] = {}
     try:
         txt = ir.files("pytead").joinpath("default_config.toml").read_text(encoding="utf-8")
@@ -333,10 +358,9 @@ def load_layered_config(start: Optional[Path] = None) -> ConfigContext:
         base = _deep_merge(base, pkg)
     except Exception as exc:
         _dbg("packaged_default_missing", error=str(exc))
-        _log.info("No packaged defaults available: %s", exc)
-        base = {}
+        _log.info("No packaged defaults (pytead/default_config.toml): %s", exc)
 
-    # 2) User-level
+    # 2) User-level config
     user_cfg_path = _find_user_config()
     if user_cfg_path:
         try:
@@ -347,11 +371,21 @@ def load_layered_config(start: Optional[Path] = None) -> ConfigContext:
             _dbg("user_config_parse_error", path=str(user_cfg_path), error=str(exc))
             _log.warning("Failed to parse user config %s: %s", user_cfg_path, exc)
 
-    # 3) Project-level
-    source_path = None
-    project_root = Path.cwd().resolve()
-    proj_cfg_path = _find_project_config((start or Path.cwd()).resolve())
+    # 3) Project-level config (anchored)
+    #    - When `start` is provided, we strictly anchor on it (ignore process CWD).
+    #    - When `start` is None (e.g., some non-script CLIs), we consciously adopt
+    #      the process CWD as the anchor to keep those commands usable.
+    source_path: Optional[Path] = None
+    if start is None:
+        anchor = Path.cwd().resolve()
+        _dbg("no_start_anchor_cwd_used", anchor=str(anchor))
+    else:
+        anchor = Path(start).resolve()
+        _dbg("anchor_from_start", anchor=str(anchor))
+
+    proj_cfg_path = _find_project_config(anchor)
     if proj_cfg_path:
+        # Merge project config and derive project_root from its location.
         try:
             data = _parse_config_file(proj_cfg_path)
             base = _deep_merge(base, data)
@@ -359,15 +393,23 @@ def load_layered_config(start: Optional[Path] = None) -> ConfigContext:
         except Exception as exc:
             _dbg("project_config_parse_error", path=str(proj_cfg_path), error=str(exc))
             _log.warning("Failed to parse project config %s: %s", proj_cfg_path, exc)
+
         source_path = proj_cfg_path
         cfg_dir = proj_cfg_path.parent
         project_root = cfg_dir.parent if cfg_dir.name == ".pytead" else cfg_dir
+        _dbg("project_root_from_config", project_root=str(project_root))
+    else:
+        # No project config; compute deterministic fallback from the anchor.
+        project_root = _resolve_project_root_fallback(anchor)
 
     ctx = ConfigContext(raw=base, project_root=project_root, source_path=source_path, debug=list(_DEBUG_EVENTS))
-    _dbg("ctx_summary", project_root=str(project_root), source=str(source_path or "<none>"),
-         top_keys=sorted(list(base.keys())))
+    _dbg(
+        "ctx_summary",
+        project_root=str(project_root),
+        source=str(source_path or "<none>"),
+        top_keys=sorted(list(base.keys())),
+    )
     return ctx
-
 def effective_section(ctx: ConfigContext, section: str) -> Dict[str, Any]:
     return _effective(section, ctx.raw)
 
@@ -488,4 +530,86 @@ def diagnostics_for_storage_dir(ctx: ConfigContext, section: str, cli_value: Pat
     lines.append(render_config_debug_report(ctx, include_previews=True))
 
     return "\n".join(lines)
+
+
+def _nearest_marker_dir(base: Path, markers: list[str], *, kind: str) -> Optional[Path]:
+    """
+    Walk upward from `base` (file or directory) until a directory that contains
+    one of the given `markers` is found.
+
+    Parameters
+    ----------
+    base : Path
+        Starting point (file or directory). If it's a file, we start from its parent.
+    markers : list[str]
+        For kind="dir": directory names to look for (e.g. [".git", ".hg", ".svn"]).
+        For kind="file": filenames to look for (e.g. ["pyproject.toml", "setup.cfg", "setup.py"]).
+    kind : str
+        Either "dir" or "file".
+
+    Returns
+    -------
+    Optional[Path]
+        The directory that *contains* the marker (i.e., the candidate project root),
+        or None if no marker is found up to the filesystem root.
+    """
+    cur = base.resolve()
+    if cur.is_file():
+        cur = cur.parent
+
+    while True:
+        try:
+            if kind == "dir":
+                if any((cur / m).is_dir() for m in markers):
+                    return cur
+            elif kind == "file":
+                if any((cur / m).is_file() for m in markers):
+                    return cur
+            else:
+                raise ValueError(f"invalid kind={kind!r}; expected 'dir' or 'file'")
+        except Exception:
+            # Be robust to permission errors or other IO oddities; just keep walking up.
+            pass
+
+        parent = cur.parent
+        if parent == cur:
+            # Reached filesystem root
+            return None
+        cur = parent
+        
+
+def _resolve_project_root_fallback(anchor: Path) -> Path:
+    """
+    Fallback chain for project_root *when no pytead config file is found*:
+
+        1) nearest VCS root ('.git' / '.hg' / '.svn')
+        2) nearest Python project root ('pyproject.toml' / 'setup.cfg' / 'setup.py')
+        3) the anchor directory itself (script directory or provided base)
+
+    Notes
+    -----
+    - `anchor` may be a file path (typical for a script) or a directory.
+      We always compute from `anchor.parent` if `anchor` is a file.
+    - This function *never* looks at the process CWD on its own;
+      it only operates relative to the given `anchor`.
+    """
+    base = anchor.resolve()
+    if base.is_file():
+        base = base.parent
+
+    # 1) VCS roots
+    vcs_root = _nearest_marker_dir(base, [".git", ".hg", ".svn"], kind="dir")
+    if vcs_root:
+        _dbg("fallback_root_vcs_found", root=str(vcs_root))
+        return vcs_root
+
+    # 2) Python project roots
+    py_root = _nearest_marker_dir(base, ["pyproject.toml", "setup.cfg", "setup.py"], kind="file")
+    if py_root:
+        _dbg("fallback_root_python_found", root=str(py_root))
+        return py_root
+
+    # 3) Base directory as last resort
+    _dbg("fallback_root_base", root=str(base))
+    return base
 

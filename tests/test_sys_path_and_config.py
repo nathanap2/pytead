@@ -230,7 +230,7 @@ def test_cmd_run_injects_paths_and_imports_targets(tmp_path, monkeypatch, caplog
 
         # 3) Logs d’instrumentation
         log_text = "\n".join(r.message for r in caplog.records)
-        assert "Instrumentation applied to 3 target(s)" in log_text
+        assert "3 target(s)" in log_text
         assert "ioutils.example" in log_text
         assert "world.BaseEntity.get_coordinates" in log_text
         assert "adjacent_mod.echo" in log_text
@@ -304,20 +304,25 @@ def test_cmd_run_resolves_relative_additional_sys_path(tmp_path, monkeypatch, ca
 
         # log instrumentation
         log_text = "\n".join(r.message for r in caplog.records)
-        assert "Instrumentation applied to 1 target(s)" in log_text
+        assert "1 target(s)" in log_text
         assert "exmod.ping" in log_text
     finally:
         os.chdir(old_cwd)
 
 
 def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog):
+    import logging, os, sys, runpy, importlib
+    from pathlib import Path
+
     caplog.set_level(logging.INFO, logger="pytead")
     repo, script = make_repo_with_yaml(tmp_path)
 
-    # No-op exécution & instrumentation
+    # No-op execution & instrumentation
+    def no_op_run_path(path, run_name=None, init_globals=None):
+        return {}
     monkeypatch.setattr(runpy, "run_path", no_op_run_path, raising=True)
-    import pytead.targets as tg
 
+    import pytead.targets as tg
     monkeypatch.setattr(
         tg, "instrument_targets", lambda targets, **kw: set(targets), raising=True
     )
@@ -325,10 +330,15 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
     import pytead.cli.cmd_tead as tead
 
     class NS:
-        pass
+        # On donne à _handle les attributs qu'il pourrait lire.
+        targets = []                 # pris depuis la config 'run'
+        cmd = None                   # on le remplit juste après
+        additional_sys_path = None
+        storage_dir = None
+        output_dir = None
+        format = None                # ou 'repr' selon la config par défaut
 
     args = NS()
-    args.targets = []  # pris depuis la config 'run'
     args.cmd = [str(script)]
 
     old_cwd = Path.cwd()
@@ -336,23 +346,24 @@ def test_tead_injects_paths_and_imports_from_yaml(tmp_path, monkeypatch, caplog)
     outside.mkdir()
     try:
         os.chdir(outside)
-        tead.run(args)
 
-        # Imports réels
+        # Nouvelle API: on appelle directement le handler interne
+        tead._handle(args)
+
+        # Imports réels (vérifie que sys.path est bien injecté depuis la config YAML)
         mod_iou = importlib.import_module("ioutils")
         assert mod_iou.example(1) == {"x": 1}
         mod_adj = importlib.import_module("adjacent_mod")
         assert mod_adj.echo("z") == "z"
 
         # Chemins présents
-        assert str((repo / "app").resolve()) in sys.path  # script dir
-        assert str(repo.resolve()) in sys.path  # base path
-        assert (
-            str((repo / "logical_entities").resolve()) in sys.path
-        )  # additional_sys_path
+        assert str((repo / "app").resolve()) in sys.path        # script dir
+        assert str(repo.resolve()) in sys.path                  # base path (project_root)
+        assert str((repo / "logical_entities").resolve()) in sys.path  # additional_sys_path
 
         # Logs (au moins une des cibles doit apparaître)
         log_text = "\n".join(r.message for r in caplog.records)
         assert ("ioutils.example" in log_text) or ("adjacent_mod.echo" in log_text)
     finally:
         os.chdir(old_cwd)
+

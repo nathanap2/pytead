@@ -1,64 +1,29 @@
 
 from __future__ import annotations
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple, Optional
+from typing import Any, Dict, Iterable, List, Tuple, Optional, Callable
 
-from .config_cli import diagnostics_for_storage_dir
+from .config_cli import diagnostics_for_storage_dir, resolve_under_project_root
+from .config_cli import load_layered_config, apply_effective_to_args
+
+
+
 
 
 
 __all__ = [
-    "split_targets_and_cmd",
     "unique_count",
     "fallback_targets_from_cfg",
     "emptyish",
-    "first_py_token",
-    "detect_start_hint",
-    "require_fields_or_exit",
     "require_script_py_or_exit",
     "resolve_output_paths",
     "ensure_storage_dir_or_exit",
     "resolve_additional_sys_path",
-    "resolve_under"
+    "resolve_under",
 ]
 
 
-def split_targets_and_cmd(
-    targets: List[str] | None,
-    cmd: List[str] | None,
-) -> Tuple[List[str], List[str]]:
-    """
-    Robustly split positional arguments into function targets and the script command.
 
-    Rules:
-    - If '--' accidentally ended up in `targets`, split there and move the tail to `cmd`.
-    - Strip a leading '--' token from `cmd` if present.
-    - If a '*.py' token was mistakenly placed among `targets`, move that token and
-      everything after it to `cmd`.
-
-    This function never mutates the input lists; it returns new lists.
-    """
-    t = list(targets or [])
-    c = list(cmd or [])
-
-    # Case 1: '--' slipped into targets → split and move the tail to cmd
-    if "--" in t:
-        sep = t.index("--")
-        c = t[sep + 1 :] + c
-        t = t[:sep]
-
-    # Case 2: defensive — argparse.REMAINDER may give a leading '--' in cmd
-    if c and c[0] == "--":
-        c = c[1:]
-
-    # Case 3: user forgot '--' and put a script in targets → move '*.py' and the rest
-    for i, tok in enumerate(t):
-        if tok.endswith(".py"):
-            c = t[i:] + c
-            t = t[:i]
-            break
-
-    return t, c
 
 
     
@@ -129,15 +94,6 @@ def emptyish(x) -> bool:
     return x is None or (isinstance(x, (str, list, dict)) and len(x) == 0)
 
 
-def first_py_token(tokens) -> Optional[Path]:
-    """Retourne le premier Path *.py trouvé dans une liste de tokens argparse."""
-    for tok in tokens or []:
-        if isinstance(tok, str) and tok.endswith(".py"):
-            try:
-                return Path(tok).resolve()
-            except Exception:
-                return Path(tok)
-    return None
 
 
 def require_script_py_or_exit(cmd: List[str], logger: Any) -> Path:
@@ -194,7 +150,7 @@ def ensure_storage_dir_or_exit(ctx, section: str, storage_dir_value: Optional[Pa
             pass
         _sys.exit(1)
 
-    p = Path(storage_dir_value)
+    p = resolve_under_project_root(ctx, storage_dir_value)
     if not p.exists() or not p.is_dir():
         logger.error("Storage (calls) directory '%s' does not exist or is not a directory", p)
         try:
@@ -233,10 +189,92 @@ def resolve_under(root: Path, p: Optional[Path]) -> Optional[Path]:
         return None
     return p if p.is_absolute() else (root / p)
 
-def detect_start_hint(args) -> Optional[Path]:
-    """
-    Return a good starting point for layered-config discovery by scanning
-    the parsed args for the first '*.py' token in either `cmd` or `targets`.
-    """
-    return first_py_token(getattr(args, "cmd", None)) or first_py_token(getattr(args, "targets", None))
 
+
+def resolve_storage_dir_for_write(ctx, storage_dir_value: Optional[Path | str], logger) -> Path:
+    """Resolve under project_root and mkdir for write-mode commands (run/tead)."""
+    p = resolve_under_project_root(ctx, storage_dir_value)
+    try:
+        Path(p).mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.error("Cannot create storage_dir '%s': %s", p, exc)
+        _sys.exit(1)
+    return p
+    
+
+def require_output_dir_or_exit(ctx, out_dir_value: Optional[Path | str], logger, section: str) -> Path:
+    """Uniformize 'output_dir is required' policy and resolution."""
+    if out_dir_value is None:
+        logger.error("`pytead %s` requires --output-dir or [%s].output_dir in config.", section, section)
+        _sys.exit(1)
+    return resolve_under_project_root(ctx, out_dir_value)
+
+def extract_script_and_argv(remainder: list[str], logger) -> Tuple[Path, list[str]]:
+    """Strip leading '--', validate .py, and return (script_path, argv)."""
+    cmd = list(remainder or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    from ._cli_utils import require_script_py_or_exit  # self-import ok
+    script_path = require_script_py_or_exit(cmd, logger)
+    return script_path, cmd  # cmd includes script + its args; run_script sets sys.argv
+
+def require_targets_or_exit(targets: list[str], ctx, logger, missing_hint_sections=("tead","run")) -> list[str]:
+    if targets:
+        return targets
+    logger.error(
+        "No target provided. Expect at least one 'module.function' or 'module.Class.method'. "
+        "Config file used: %s ; checked sections: %s",
+        str(getattr(ctx, "source_path", None) or "<none>"),
+        ", ".join(f"[{s}].targets" for s in missing_hint_sections),
+    )
+    _sys.exit(1)
+
+def normalize_additional_sys_path(project_root: Path, raw_paths: Iterable[str] | None) -> list[str]:
+    """
+    Compute import roots for CLI commands.
+    Policy:
+      - Always include project_root first.
+      - Then resolve each additional path (relative under project_root or absolute).
+      - Return absolute strings, deduped with order preserved.
+    """
+    pr = str(project_root.resolve())
+    roots: list[str] = [pr]
+
+    seen = {pr}
+    for raw in raw_paths or []:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            p = (project_root / p).resolve()
+        else:
+            p = p.resolve()
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            roots.append(s)
+
+    return roots
+    
+def load_ctx_and_fill(section: str, args, start_getter: Callable[[object], Optional[Path]]):
+    start = start_getter(args)
+    ctx = load_layered_config(start=start)
+    apply_effective_to_args(section, ctx, args)
+    
+    # Fallbacks: when section == "tead", inherit missing keys from "run"
+    if section == "tead":
+        try:
+            from ._common import eff
+            eff_tead = eff(ctx, "tead")
+            eff_run  = eff(ctx, "run")
+            for key in ("additional_sys_path", "targets"):
+                if getattr(args, key, None) in (None, [], ()):
+                    val = eff_tead.get(key)
+                    if not val:
+                        val = eff_run.get(key)
+                    if val:
+                        setattr(args, key, val)
+        except Exception:
+            # Soft-fail: if eff or ctx layout changes, don't break the CLI
+            pass
+    return ctx
