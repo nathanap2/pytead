@@ -622,7 +622,7 @@ def write_tests_per_func(
     """
     Write one test module per function into `output_dir`.
 
-    For legacy formats, tests are parameterized state-based tests.
+    For state-based (pickle), tests are parameterized state-based tests.
     For graph-json, each trace becomes a snapshot test function.
 
     Robustness tweak:

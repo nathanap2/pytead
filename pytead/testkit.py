@@ -32,7 +32,7 @@ __all__ = [
     "rehydrate_from_graph",
 ]
 
-# Type alias for legacy/state-based case tuples
+# Type alias for state-based case tuples
 Case = Tuple[
     tuple,              # args
     dict,               # kwargs

@@ -76,37 +76,6 @@ def _inline_refs_from_donors(node, donor_index):
         return node
 
 
-def _validate_or_fix_graphjson_entry(entry, strict_mode="error"):
-    """Best-effort pour supprimer toute ref orpheline dans result_graph,
-    puis validation stricte. Renvoie *une copie* potentiellement corrigée.
-    strict_mode: "error" (défaut) | "warn"  (si tu veux dégrader en warning).
-    """
-    func = entry.get("func", "<unknown>")
-    args_g = entry.get("args_graph", [])
-    kwargs_g = entry.get("kwargs_graph", {})
-    result_g = entry.get("result_graph", None)
-
-    # 1) Tentative de correction : inliner les $ref qui pointent vers des ancres des donneurs
-    donor_index = _build_ref_donor_index([args_g, kwargs_g])
-    fixed_result = _inline_refs_from_donors(result_g, donor_index)
-
-    # 2) Validation : plus aucune ref orpheline en considérant args/kwargs comme donneurs
-    orphans = find_orphan_refs(fixed_result, donors_graphs=[args_g, kwargs_g])
-    if orphans:
-        msg = (
-            f"ORPHAN_REF in trace for {func}: {len(orphans)} orphan(s): "
-            + ", ".join(f"{p} -> ref={rid}" for p, rid in orphans)
-        )
-        if strict_mode == "warn":
-            log.warning(msg)
-        else:
-            # mode "error" par défaut
-            raise OrphanRefInTrace(msg)
-
-    # 3) Retourne une copie de l'entry avec result_graph corrigé
-    fixed = dict(entry)
-    fixed["result_graph"] = fixed_result
-    return fixed
     
 def _build_graphjson_entry_unified(func_qualname, args, kwargs, result):
     """
@@ -676,19 +645,6 @@ def trace(
     include_private_objects: bool = False,
     objects_stringify_depth: int = 1,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """
-    Décorateur d’instrumentation.
-
-    - Legacy storages (pickle/json/repr): enregistre
-        - args/kwargs/result
-        - bloc "self" pour les méthodes d'instance:
-            * before/after : attributs publics uniquement
-            * state_before/state_after : état complet (y compris privés)
-        - "obj_args" (spécifs d'objets non-builtin dans args/kwargs)
-        - "result_obj" si le résultat est un objet non-builtin
-    - Graph JSON ('.gjson'): enregistre l'IR v2 (args_graph/kwargs_graph/result_graph)
-      avec strict configurable.
-    """
     # Résolution du backend
     if isinstance(storage, str):
         from .storage import get_storage

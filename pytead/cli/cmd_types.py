@@ -37,7 +37,6 @@ def _handle(args: argparse.Namespace) -> None:
     out_value: Optional[Path | str] = (
         getattr(args, "output_dir", None)
         or eff_types.get("output_dir")
-        or eff_types.get("out_dir")  # legacy key tolerated if present
     )
     output_dir: Path = require_output_dir_or_exit(ctx, out_value, log, section="types")
 
